@@ -55,9 +55,9 @@ function scoreFromReaction(elapsed, lifetime) {
 }
 const MIN_DIST = 8; // minimum % distance between mark centers
 function randomPos(existing = []) {
-  const PAD_X = 5;
-  const PAD_Y_TOP = 12;
-  const PAD_Y_BOTTOM = 5;
+  const PAD_X = 10;
+  const PAD_Y_TOP = 5;
+  const PAD_Y_BOTTOM = 12;
   for (let attempt = 0; attempt < 20; attempt++) {
     const x = PAD_X + Math.random() * (100 - PAD_X * 2);
     const y = PAD_Y_TOP + Math.random() * (100 - PAD_Y_TOP - PAD_Y_BOTTOM);
