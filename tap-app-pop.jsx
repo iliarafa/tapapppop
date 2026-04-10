@@ -206,7 +206,7 @@ function Mark({ mark, onTap, theme, rgbColor, label }) {
     return () => cancelAnimationFrame(frameRef.current);
   }, [mark.lifetime]);
 
-  const size = 36;
+  const size = 54;
   const opacity = 1 - progress * 0.7;
   const shape = markShapes[mark.shape];
   const fillColor = rgbColor || theme.fg;
@@ -225,7 +225,7 @@ function Mark({ mark, onTap, theme, rgbColor, label }) {
       </svg>
       {label != null && (
         <span style={{
-          position:"absolute", fontSize:14, fontWeight:400,
+          position:"absolute", fontSize:20, fontWeight:400,
           fontFamily:"'Press Start 2P', monospace",
           color: theme.bg, pointerEvents:"none", opacity,
         }}>{label}</span>
