@@ -1,5 +1,121 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
+// ============================================================
+// Audio Engine — Web Audio API chiptune synth, zero audio files
+// ============================================================
+const audio = (() => {
+  let ctx, masterGain, sfxGain;
+
+  function ensureCtx() {
+    if (ctx) return;
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    masterGain = ctx.createGain(); masterGain.gain.value = 0.5; masterGain.connect(ctx.destination);
+    sfxGain = ctx.createGain(); sfxGain.gain.value = 0.6; sfxGain.connect(masterGain);
+  }
+
+  // --- Synth helpers ---
+  function playNote(freq, dur, type, vol, dest, startTime) {
+    if (!ctx) return;
+    const t = startTime || ctx.currentTime;
+    const osc = ctx.createOscillator();
+    const g = ctx.createGain();
+    osc.type = type; osc.frequency.value = freq;
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    osc.connect(g); g.connect(dest);
+    osc.start(t); osc.stop(t + dur);
+  }
+
+  function playNoise(dur, vol, dest, startTime) {
+    if (!ctx) return;
+    const t = startTime || ctx.currentTime;
+    const bufSize = ctx.sampleRate * dur;
+    const buf = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < bufSize; i++) data[i] = Math.random() * 2 - 1;
+    const src = ctx.createBufferSource(); src.buffer = buf;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    src.connect(g); g.connect(dest);
+    src.start(t); src.stop(t + dur);
+  }
+
+  // --- SFX ---
+  function sfxTap() {
+    ensureCtx();
+    playNote(880, 0.06, "square", 0.3, sfxGain);
+    playNote(1320, 0.04, "square", 0.15, sfxGain, ctx.currentTime + 0.02);
+  }
+  function sfxMiss() {
+    ensureCtx();
+    playNote(150, 0.12, "square", 0.25, sfxGain);
+  }
+  function sfxLifeLost() {
+    ensureCtx();
+    playNote(440, 0.1, "square", 0.3, sfxGain);
+    playNote(220, 0.15, "square", 0.25, sfxGain, ctx.currentTime + 0.1);
+  }
+  function sfxChainComplete() {
+    ensureCtx();
+    playNote(523, 0.08, "triangle", 0.3, sfxGain);
+    playNote(659, 0.08, "triangle", 0.3, sfxGain, ctx.currentTime + 0.08);
+    playNote(784, 0.12, "triangle", 0.35, sfxGain, ctx.currentTime + 0.16);
+  }
+  function sfxBatchComplete() {
+    ensureCtx();
+    const notes = [523, 587, 659, 698, 784];
+    notes.forEach((f, i) => playNote(f, 0.06, "triangle", 0.25, sfxGain, ctx.currentTime + i * 0.05));
+  }
+  function sfxGameOver() {
+    ensureCtx();
+    const notes = [523, 440, 349, 262];
+    notes.forEach((f, i) => playNote(f, 0.15, "triangle", 0.3, sfxGain, ctx.currentTime + i * 0.15));
+  }
+  function sfxButtonClick() {
+    ensureCtx();
+    playNote(660, 0.03, "square", 0.15, sfxGain);
+  }
+
+  // --- Music (MP3-based) ---
+  let currentMusic = null;
+  let musicElement = null;
+
+  function stopMusic() {
+    if (musicElement) { musicElement.pause(); musicElement.currentTime = 0; }
+    currentMusic = null;
+  }
+
+  function playTrack(name, src) {
+    if (currentMusic === name) return;
+    stopMusic();
+    currentMusic = name;
+    musicElement = new Audio(src);
+    musicElement.loop = true;
+    musicElement.volume = 0.35;
+    if (masterGain && masterGain.gain.value < 0.01) musicElement.muted = true;
+    musicElement.play().catch(() => {});
+  }
+
+  function playMain() { playTrack("main", "/music/mainmusic.mp3"); }
+  function playGameplay() { playTrack("game", "/music/gamemusic.mp3"); }
+
+  function toggleMute() {
+    if (!masterGain) return false;
+    const muted = masterGain.gain.value < 0.01;
+    masterGain.gain.value = muted ? 0.5 : 0;
+    if (musicElement) musicElement.muted = !muted;
+    return !muted;
+  }
+  function isMuted() { return masterGain ? masterGain.gain.value < 0.01 : false; }
+
+  return {
+    ensureCtx, sfxTap, sfxMiss, sfxLifeLost, sfxChainComplete,
+    sfxBatchComplete, sfxGameOver, sfxButtonClick,
+    playMain, playGameplay, stopMusic, toggleMute, isMuted,
+  };
+})();
+
 const GAME_DURATION = 30;
 // Classic difficulty ramp: t = elapsed seconds (0–30)
 const classicDifficulty = (t) => {
@@ -131,7 +247,7 @@ function FloatingText({ x, y, value, text, color }) {
 
 function Btn({ label, onClick, theme, ghost }) {
   return (
-    <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); onClick(); }}
+    <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); audio.sfxButtonClick(); onClick(); }}
       style={{
         padding: "14px 24px", fontSize: 10, letterSpacing: 2,
         color: ghost ? theme.fgMid : theme.bg,
@@ -264,7 +380,7 @@ export default function TapAppPop() {
     });
     setTimeout(() => {
       setMarks((prev) => {
-        if (prev.find((m) => m.id === id)) setMisses((m) => m + 1);
+        if (prev.find((m) => m.id === id)) { setMisses((m) => m + 1); audio.sfxMiss(); }
         return prev.filter((m) => m.id !== id);
       });
       delete markBirths.current[id];
@@ -313,7 +429,7 @@ export default function TapAppPop() {
     scheduleClassic();
     gameTimer.current = setInterval(() => {
       setTimeLeft((tt) => {
-        if (tt <= 1) { cleanup(); setTimeout(() => setScreen("end"), 300); return 0; }
+        if (tt <= 1) { cleanup(); audio.sfxGameOver(); setTimeout(() => setScreen("end"), 300); return 0; }
         return tt - 1;
       });
     }, 1000);
@@ -356,10 +472,11 @@ export default function TapAppPop() {
         return [];
       });
       mathCounterRef.current = 1;
+      audio.sfxLifeLost();
       setLives((l) => {
         const next = l - 1;
         livesRef.current = next;
-        if (next <= 0) { cleanup(); setTimeout(() => setScreen("end"), 400); }
+        if (next <= 0) { cleanup(); audio.sfxGameOver(); setTimeout(() => setScreen("end"), 400); }
         else { setTimeout(() => spawnMathBatch(), 400); }
         return next;
       });
@@ -379,10 +496,18 @@ export default function TapAppPop() {
 
   useEffect(() => cleanup, []);
 
+  // --- Music: main track for menus, game track for gameplay ---
+  useEffect(() => {
+    audio.ensureCtx();
+    if (screen === "play") audio.playGameplay();
+    else audio.playMain();
+  }, [screen]);
+
   // --- Classic tap ---
   const handleClassicTap = useCallback((id) => {
     const birth = markBirths.current[id];
     if (!birth) return;
+    audio.sfxTap();
     delete markBirths.current[id];
     setMarks((prev) => {
       const m = prev.find((mk) => mk.id === id);
@@ -408,6 +533,7 @@ export default function TapAppPop() {
     setRgbNext((expected) => {
       if (colorIdx === expected) {
         // Correct tap — increase pressure
+        audio.sfxTap();
         const diff = rgbDifficulty(pressureRef.current);
         const pts = Math.round(scoreFromReaction(Date.now() - birth, diff.lifetime) * diff.multiplier);
         const newP = Math.min(pressureRef.current + RGB_PRESSURE_PER_TAP, RGB_MAX_PRESSURE);
@@ -426,10 +552,11 @@ export default function TapAppPop() {
         setScore((s) => s + pts);
         setTaps((tt) => tt + 1);
         const next = (expected + 1) % 3;
-        if (next === 0) setRgbChains((c) => c + 1);
+        if (next === 0) { setRgbChains((c) => c + 1); audio.sfxChainComplete(); }
         return next;
       } else {
         // Wrong tap — lose life, drop pressure, reset to R
+        audio.sfxMiss();
         const newP = Math.max(pressureRef.current - RGB_PRESSURE_DROP, 0);
         pressureRef.current = newP;
         setPressure(newP);
@@ -444,8 +571,10 @@ export default function TapAppPop() {
         setLives((l) => {
           const next = l - 1;
           livesRef.current = next;
+          audio.sfxLifeLost();
           if (next <= 0) {
             cleanup();
+            audio.sfxGameOver();
             setTimeout(() => setScreen("end"), 400);
           }
           return next;
@@ -464,6 +593,7 @@ export default function TapAppPop() {
     setMathNext((expected) => {
       if (num === expected) {
         // Correct
+        audio.sfxTap();
         const diff = mathDifficulty(mathRoundRef.current);
         const pts = scoreFromReaction(Date.now() - birth, diff.lifetime);
         delete markBirths.current[id];
@@ -481,18 +611,20 @@ export default function TapAppPop() {
         const next = expected + 1;
         const batchEnd = mathCounterRef.current + diff.batchSize;
         if (next >= batchEnd) {
-          // Round complete — advance counter for next batch
+          // Round complete
+          audio.sfxBatchComplete();
           mathCounterRef.current = batchEnd;
           mathRoundRef.current += 1;
           setMathRounds((r) => r + 1);
           mathTimers.current.forEach(clearTimeout);
           mathTimers.current = [];
           setTimeout(() => spawnMathBatch(), 400);
-          return batchEnd; // will be overwritten by spawnMathBatch's setMathNext
+          return batchEnd;
         }
         return next;
       } else {
         // Wrong tap — lose life, reset counter to 1
+        audio.sfxMiss();
         mathCounterRef.current = 1;
         setMarks((prev) => {
           const m = prev.find((mk) => mk.id === id);
@@ -509,8 +641,10 @@ export default function TapAppPop() {
         setLives((l) => {
           const next = l - 1;
           livesRef.current = next;
+          audio.sfxLifeLost();
           if (next <= 0) {
             cleanup();
+            audio.sfxGameOver();
             setTimeout(() => setScreen("end"), 400);
           } else {
             setTimeout(() => spawnMathBatch(), 400);
@@ -541,37 +675,19 @@ export default function TapAppPop() {
     @keyframes squarePulse { 0% { opacity:0; transform:translate(-50%,-50%) scale(0.5); } 20% { opacity:0.18; transform:translate(-50%,-50%) scale(1); } 80% { opacity:0.18; transform:translate(-50%,-50%) scale(1); } 100% { opacity:0; transform:translate(-50%,-50%) scale(0.5); } }
   `;
 
-  const ThemeToggle = () => (
-    <div onPointerDown={toggleMode} style={{
-      position:"absolute", top:48, right:20, zIndex:20, cursor:"pointer",
-      WebkitTapHighlightColor:"transparent", touchAction:"manipulation",
-    }}>
-      <svg width="18" height="18" viewBox="0 0 9 9" fill="none" style={{ imageRendering:"pixelated" }}>
-        <rect x="3" y="3" width="3" height="3" fill={t.fg} />
-        <rect x="4" y="1" width="1" height="1" fill={t.fg} />
-        <rect x="4" y="7" width="1" height="1" fill={t.fg} />
-        <rect x="1" y="4" width="1" height="1" fill={t.fg} />
-        <rect x="7" y="4" width="1" height="1" fill={t.fg} />
-        <rect x="2" y="2" width="1" height="1" fill={t.fg} />
-        <rect x="6" y="2" width="1" height="1" fill={t.fg} />
-        <rect x="2" y="6" width="1" height="1" fill={t.fg} />
-        <rect x="6" y="6" width="1" height="1" fill={t.fg} />
-      </svg>
-    </div>
-  );
+  const [muted, setMuted] = useState(false);
 
   // ===== TITLE =====
   if (screen === "title") {
     return (
       <div style={base}>
         <style>{globalStyles}</style>
-        <ThemeToggle />
         <TitleBgSquares />
         <div onPointerDown={(e) => { e.preventDefault(); setScreen("menu"); }}
           style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", height:"100%", gap:4, position:"relative", zIndex:1, cursor:"pointer" }}>
           <h1 style={{ fontSize:38, fontWeight:400, letterSpacing:6, lineHeight:1.3 }}>TAP</h1>
+          <h1 style={{ fontSize:38, fontWeight:400, letterSpacing:6, lineHeight:1.3 }}>TAP</h1>
           <h1 style={{ fontSize:38, fontWeight:400, letterSpacing:6, lineHeight:1.3 }}>APP</h1>
-          <h1 style={{ fontSize:38, fontWeight:400, letterSpacing:6, lineHeight:1.3 }}>POP</h1>
           <p style={{ fontSize:7, color:t.fgLow, letterSpacing:3, marginTop:48, animation:"pulse 2s ease-in-out infinite" }}>TAP TO START</p>
         </div>
       </div>
@@ -583,14 +699,45 @@ export default function TapAppPop() {
     return (
       <div style={base}>
         <style>{globalStyles}</style>
-        <ThemeToggle />
         <TitleBgSquares />
         <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", height:"100%", gap:12, position:"relative", zIndex:1 }}>
           <Btn label="CLASSIC" onClick={startClassic} theme={t} />
           <Btn label="RGB" onClick={startRgb} theme={t} ghost />
           <Btn label="MATH" onClick={startMath} theme={t} ghost />
-          <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setScreen("title"); }}
-            style={{ marginTop:32, fontSize:7, color:t.fgLow, letterSpacing:2, cursor:"pointer", WebkitTapHighlightColor:"transparent", touchAction:"manipulation" }}>BACK</div>
+          <div style={{ display:"flex", gap:24, marginTop:32 }}>
+            <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setScreen("settings"); }}
+              style={{ fontSize:7, color:t.fgLow, letterSpacing:2, cursor:"pointer", WebkitTapHighlightColor:"transparent", touchAction:"manipulation" }}>SETTINGS</div>
+            <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setScreen("title"); }}
+              style={{ fontSize:7, color:t.fgLow, letterSpacing:2, cursor:"pointer", WebkitTapHighlightColor:"transparent", touchAction:"manipulation" }}>BACK</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // ===== SETTINGS =====
+  if (screen === "settings") {
+    return (
+      <div style={base}>
+        <style>{globalStyles}</style>
+        <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", height:"100%", gap:0 }}>
+          <p style={{ fontSize:12, letterSpacing:4, marginBottom:48 }}>SETTINGS</p>
+          <div style={{ display:"flex", flexDirection:"column", gap:24, width:"60%", maxWidth:280 }}>
+            {/* Theme */}
+            <div onPointerDown={(e) => { e.preventDefault(); toggleMode(e); }}
+              style={{ display:"flex", justifyContent:"space-between", alignItems:"center", cursor:"pointer", WebkitTapHighlightColor:"transparent", touchAction:"manipulation" }}>
+              <span style={{ fontSize:8, letterSpacing:2, color:t.fgMid }}>THEME</span>
+              <span style={{ fontSize:8, letterSpacing:2 }}>{mode === "night" ? "NIGHT" : "DAY"}</span>
+            </div>
+            {/* Sound */}
+            <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); const on = audio.toggleMute(); setMuted(!on); }}
+              style={{ display:"flex", justifyContent:"space-between", alignItems:"center", cursor:"pointer", WebkitTapHighlightColor:"transparent", touchAction:"manipulation" }}>
+              <span style={{ fontSize:8, letterSpacing:2, color:t.fgMid }}>SOUND</span>
+              <span style={{ fontSize:8, letterSpacing:2 }}>{muted ? "OFF" : "ON"}</span>
+            </div>
+          </div>
+          <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setScreen("menu"); }}
+            style={{ marginTop:48, fontSize:7, color:t.fgLow, letterSpacing:2, cursor:"pointer", WebkitTapHighlightColor:"transparent", touchAction:"manipulation" }}>BACK</div>
         </div>
       </div>
     );
