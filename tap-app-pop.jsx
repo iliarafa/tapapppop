@@ -170,20 +170,31 @@ function scoreFromReaction(elapsed, lifetime) {
   return Math.round(lerp(SCORE_MAX, SCORE_MIN, Math.min(elapsed / lifetime, 1)));
 }
 const MIN_DIST = 8; // minimum % distance between mark centers
+const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5)); // ~137.5° in radians
+let spawnIndex = 0; // global spawn counter for golden-angle sequence
+
 function randomPos(existing = []) {
   const PAD_X = 10;
   const PAD_Y_TOP = 5;
   const PAD_Y_BOTTOM = 12;
-  for (let attempt = 0; attempt < 20; attempt++) {
-    const x = PAD_X + Math.random() * (100 - PAD_X * 2);
-    const y = PAD_Y_TOP + Math.random() * (100 - PAD_Y_TOP - PAD_Y_BOTTOM);
+  const rangeX = 100 - PAD_X * 2;
+  const rangeY = 100 - PAD_Y_TOP - PAD_Y_BOTTOM;
+  for (let attempt = 0; attempt < 30; attempt++) {
+    // golden-angle candidate: deterministic spiral mapped to rectangle
+    const idx = spawnIndex + attempt;
+    const r = 0.15 + 0.35 * Math.sqrt(idx);
+    const theta = idx * GOLDEN_ANGLE;
+    // map polar to rectangular, wrap into playable area
+    let x = PAD_X + (((50 + r * rangeX * Math.cos(theta)) % rangeX) + rangeX) % rangeX;
+    let y = PAD_Y_TOP + (((50 + r * rangeY * Math.sin(theta)) % rangeY) + rangeY) % rangeY;
     const tooClose = existing.some((m) => Math.hypot(m.x - x, m.y - y) < MIN_DIST);
-    if (!tooClose) return { x, y };
+    if (!tooClose) { spawnIndex++; return { x, y }; }
   }
-  // fallback after 20 tries — place it anyway
+  // fallback — random placement
+  spawnIndex++;
   return {
-    x: PAD_X + Math.random() * (100 - PAD_X * 2),
-    y: PAD_Y_TOP + Math.random() * (100 - PAD_Y_TOP - PAD_Y_BOTTOM),
+    x: PAD_X + Math.random() * rangeX,
+    y: PAD_Y_TOP + Math.random() * rangeY,
   };
 }
 
@@ -424,7 +435,7 @@ export default function TapAppPop() {
   // --- Start games ---
   const startClassic = useCallback(() => {
     setScore(0); setMarks([]); setFloats([]); setTaps(0); setMisses(0);
-    setTimeLeft(GAME_DURATION); markBirths.current = {}; setGameMode("classic"); setScreen("play");
+    setTimeLeft(GAME_DURATION); markBirths.current = {}; spawnIndex = 0; setGameMode("classic"); setScreen("play");
     classicStartRef.current = Date.now();
     scheduleClassic();
     gameTimer.current = setInterval(() => {
@@ -440,7 +451,7 @@ export default function TapAppPop() {
     setLives(RGB_MAX_LIVES); livesRef.current = RGB_MAX_LIVES;
     setRgbNext(0); setRgbChains(0); setTimeLeft(0);
     setPressure(0); pressureRef.current = 0; setPeakPressure(0);
-    markBirths.current = {}; markColors.current = {};
+    markBirths.current = {}; markColors.current = {}; spawnIndex = 0;
     setGameMode("rgb"); setScreen("play");
     scheduleRgb();
   }, [scheduleRgb]);
@@ -488,7 +499,7 @@ export default function TapAppPop() {
     setScore(0); setMarks([]); setFloats([]); setTaps(0); setMisses(0);
     setLives(MATH_MAX_LIVES); livesRef.current = MATH_MAX_LIVES;
     setMathNext(1); setMathRounds(0); mathRoundRef.current = 0; mathCounterRef.current = 1;
-    markBirths.current = {}; markLabels.current = {};
+    markBirths.current = {}; markLabels.current = {}; spawnIndex = 0;
     mathTimers.current.forEach(clearTimeout); mathTimers.current = [];
     setGameMode("math"); setScreen("play");
     setTimeout(() => spawnMathBatch(), 100);
@@ -702,7 +713,7 @@ export default function TapAppPop() {
         <TitleBgSquares />
         <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", height:"100%", gap:12, position:"relative", zIndex:1 }}>
           <Btn label="CLASSIC" onClick={startClassic} theme={t} />
-          <Btn label="RGB" onClick={startRgb} theme={t} ghost />
+          <Btn label="RBG" onClick={startRgb} theme={t} ghost />
           <Btn label="MATH" onClick={startMath} theme={t} ghost />
           <div style={{ display:"flex", justifyContent:"space-between", width:180, marginTop:32 }}>
             <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setScreen("settings"); }}
@@ -755,7 +766,7 @@ export default function TapAppPop() {
         <style>{globalStyles}</style>
         <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", height:"100%", gap:0 }}>
           <p style={{ fontSize:10, color:t.fgMid, letterSpacing:4, marginBottom:8 }}>
-            {isMath ? "MATH" : isRgb ? "RGB" : "CLASSIC"}
+            {isMath ? "MATH" : isRgb ? "RBG" : "CLASSIC"}
           </p>
           <h1 style={{ fontSize:48, fontWeight:400, letterSpacing:4 }}>{score}</h1>
           <div style={{ display:"flex", gap:32, marginTop:32 }}>
