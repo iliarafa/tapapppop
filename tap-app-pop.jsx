@@ -249,7 +249,7 @@ function Btn({ label, onClick, theme, ghost }) {
   return (
     <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); audio.sfxButtonClick(); onClick(); }}
       style={{
-        padding: "14px 24px", fontSize: 10, letterSpacing: 2,
+        padding: "14px 24px", fontSize: 10, letterSpacing: 2, minWidth: 180, textAlign: "center", boxSizing: "border-box",
         color: ghost ? theme.fgMid : theme.bg,
         backgroundColor: ghost ? "transparent" : theme.fg,
         border: ghost ? `1px solid ${theme.fgFaint}` : "none",
@@ -704,7 +704,7 @@ export default function TapAppPop() {
           <Btn label="CLASSIC" onClick={startClassic} theme={t} />
           <Btn label="RGB" onClick={startRgb} theme={t} ghost />
           <Btn label="MATH" onClick={startMath} theme={t} ghost />
-          <div style={{ display:"flex", gap:24, marginTop:32 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", width:180, marginTop:32 }}>
             <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setScreen("settings"); }}
               style={{ fontSize:7, color:t.fgLow, letterSpacing:2, cursor:"pointer", WebkitTapHighlightColor:"transparent", touchAction:"manipulation" }}>SETTINGS</div>
             <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setScreen("title"); }}
