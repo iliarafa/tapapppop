@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 
 // ============================================================
 // Audio Engine — Web Audio API chiptune synth, zero audio files
@@ -159,6 +159,108 @@ const RGB_COLORS = [
   { name: "B", color: "#3b82f6" },
   { name: "G", color: "#22c55e" },
 ];
+
+// ============================================================
+// History persistence — localStorage, versioned
+// ============================================================
+const HISTORY_KEY = "tapapppop:history:v1";
+const HISTORY_MAX = 50;
+
+function loadHistory() {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return { version: 1, runs: [] };
+    const raw = window.localStorage.getItem(HISTORY_KEY);
+    if (!raw) return { version: 1, runs: [] };
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.runs)) return { version: 1, runs: [] };
+    return parsed;
+  } catch {
+    return { version: 1, runs: [] };
+  }
+}
+
+function saveHistory(history) {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return;
+    window.localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+  } catch {}
+}
+
+function appendRun(run) {
+  const current = loadHistory();
+  const runs = [run, ...current.runs].slice(0, HISTORY_MAX);
+  saveHistory({ version: 1, runs });
+  return runs;
+}
+
+function clearHistoryStorage() {
+  try {
+    if (typeof window === "undefined" || !window.localStorage) return;
+    window.localStorage.removeItem(HISTORY_KEY);
+  } catch {}
+}
+
+function makeRunId() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+}
+
+function buildRun(mode, stats) {
+  const base = { id: makeRunId(), mode, ts: Date.now(), score: stats.score, taps: stats.taps };
+  if (mode === "classic") {
+    const accuracy = stats.taps + stats.misses > 0
+      ? Math.round((stats.taps / (stats.taps + stats.misses)) * 100) : 0;
+    const avg = stats.taps > 0 ? Math.round(stats.score / stats.taps) : 0;
+    return { ...base, misses: stats.misses, accuracy, avg };
+  }
+  if (mode === "rgb") {
+    return {
+      ...base,
+      rgbChains: stats.rgbChains,
+      peakPressure: stats.peakPressure,
+      peakMultiplier: rgbDifficulty(stats.peakPressure).multiplier,
+    };
+  }
+  if (mode === "math") {
+    const avg = stats.taps > 0 ? Math.round(stats.score / stats.taps) : 0;
+    return { ...base, mathRounds: stats.mathRounds, avg };
+  }
+  return base;
+}
+
+function computeBests(runs) {
+  const result = {
+    classic: { count: 0, bestScore: 0, bestAccuracy: 0 },
+    rgb: { count: 0, bestScore: 0, mostChains: 0, peakMultiplier: 1 },
+    math: { count: 0, bestScore: 0, mostRounds: 0 },
+  };
+  for (const r of runs) {
+    const b = result[r.mode];
+    if (!b) continue;
+    b.count += 1;
+    if ((r.score || 0) > b.bestScore) b.bestScore = r.score || 0;
+    if (r.mode === "classic" && (r.accuracy || 0) > b.bestAccuracy) b.bestAccuracy = r.accuracy;
+    if (r.mode === "rgb") {
+      if ((r.rgbChains || 0) > b.mostChains) b.mostChains = r.rgbChains;
+      if ((r.peakMultiplier || 1) > b.peakMultiplier) b.peakMultiplier = r.peakMultiplier;
+    }
+    if (r.mode === "math" && (r.mathRounds || 0) > b.mostRounds) b.mostRounds = r.mathRounds;
+  }
+  return result;
+}
+
+function timeAgo(ts) {
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h`;
+  const d = Math.round(h / 24);
+  return `${d}d`;
+}
+
+const MODE_LABEL = { classic: "CLASSIC", rgb: "RBG", math: "MATH" };
 
 const themes = {
   night: { bg: "#0a0a0a", fg: "#ffffff", fgMid: "rgba(255,255,255,0.5)", fgLow: "rgba(255,255,255,0.3)", fgFaint: "rgba(255,255,255,0.12)", fgSubtle: "rgba(255,255,255,0.08)", bar: "rgba(255,255,255,0.35)" },
@@ -362,6 +464,11 @@ export default function TapAppPop() {
   // MATH state
   const [mathNext, setMathNext] = useState(1);
   const [mathRounds, setMathRounds] = useState(0);
+  // History
+  const [history, setHistory] = useState(() => loadHistory().runs);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const confirmClearTimer = useRef();
+  const bests = useMemo(() => computeBests(history), [history]);
 
   const markBirths = useRef({});
   const markColors = useRef({});
@@ -512,6 +619,14 @@ export default function TapAppPop() {
     audio.ensureCtx();
     if (screen === "play") audio.playGameplay();
     else audio.playMain();
+  }, [screen]);
+
+  // --- Record run to history when a game ends ---
+  useEffect(() => {
+    if (screen !== "end") return;
+    const run = buildRun(gameMode, { score, taps, misses, rgbChains, peakPressure, mathRounds });
+    setHistory(appendRun(run));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [screen]);
 
   // --- Classic tap ---
@@ -716,10 +831,10 @@ export default function TapAppPop() {
           <Btn label="RBG" onClick={startRgb} theme={t} ghost />
           <Btn label="MATH" onClick={startMath} theme={t} ghost />
           <div style={{ display:"flex", justifyContent:"space-between", width:180, marginTop:32 }}>
-            <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setScreen("settings"); }}
-              style={{ fontSize:7, color:t.fgLow, letterSpacing:2, cursor:"pointer", WebkitTapHighlightColor:"transparent", touchAction:"manipulation" }}>SETTINGS</div>
             <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setScreen("title"); }}
               style={{ fontSize:7, color:t.fgLow, letterSpacing:2, cursor:"pointer", WebkitTapHighlightColor:"transparent", touchAction:"manipulation" }}>BACK</div>
+            <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setScreen("settings"); }}
+              style={{ fontSize:7, color:t.fgLow, letterSpacing:2, cursor:"pointer", WebkitTapHighlightColor:"transparent", touchAction:"manipulation" }}>SETTINGS</div>
           </div>
         </div>
       </div>
@@ -746,9 +861,114 @@ export default function TapAppPop() {
               <span style={{ fontSize:8, letterSpacing:2, color:t.fgMid }}>SOUND</span>
               <span style={{ fontSize:8, letterSpacing:2 }}>{muted ? "OFF" : "ON"}</span>
             </div>
+            {/* History */}
+            <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setScreen("history"); }}
+              style={{ display:"flex", justifyContent:"space-between", alignItems:"center", cursor:"pointer", WebkitTapHighlightColor:"transparent", touchAction:"manipulation" }}>
+              <span style={{ fontSize:8, letterSpacing:2, color:t.fgMid }}>HISTORY</span>
+              <span style={{ fontSize:8, letterSpacing:2 }}>→</span>
+            </div>
           </div>
           <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setScreen("menu"); }}
             style={{ marginTop:48, fontSize:7, color:t.fgLow, letterSpacing:2, cursor:"pointer", WebkitTapHighlightColor:"transparent", touchAction:"manipulation" }}>BACK</div>
+        </div>
+      </div>
+    );
+  }
+
+  // ===== HISTORY =====
+  if (screen === "history") {
+    const handleClearHistory = () => {
+      if (confirmClear) {
+        clearHistoryStorage();
+        setHistory([]);
+        setConfirmClear(false);
+        clearTimeout(confirmClearTimer.current);
+      } else {
+        setConfirmClear(true);
+        clearTimeout(confirmClearTimer.current);
+        confirmClearTimer.current = setTimeout(() => setConfirmClear(false), 3000);
+      }
+    };
+    const secondaryStat = (r) => {
+      if (r.mode === "classic") return `ACC ${r.accuracy ?? 0}%`;
+      if (r.mode === "rgb") return `x${(r.peakMultiplier ?? 1).toFixed(2)} · ${r.rgbChains ?? 0}C`;
+      if (r.mode === "math") return `R ${r.mathRounds ?? 0}`;
+      return "";
+    };
+    const modes = ["classic", "rgb", "math"];
+    const modeSecondary = (m) => {
+      if (m === "classic") return [`${bests.classic.bestAccuracy}%`, "BEST ACC"];
+      if (m === "rgb") return [`x${bests.rgb.peakMultiplier.toFixed(2)}`, "PEAK"];
+      return [`${bests.math.mostRounds}`, "ROUNDS"];
+    };
+    return (
+      <div style={base}>
+        <style>{globalStyles}</style>
+        <div style={{ display:"flex", flexDirection:"column", alignItems:"center", height:"100%", padding:"52px 20px 24px", boxSizing:"border-box" }}>
+          <p style={{ fontSize:12, letterSpacing:4, marginBottom:24 }}>HISTORY</p>
+
+          {history.length === 0 ? (
+            <div style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"center" }}>
+              <span style={{ fontSize:9, color:t.fgLow, letterSpacing:3 }}>NO RUNS YET</span>
+            </div>
+          ) : (
+            <>
+              <p style={{ fontSize:7, color:t.fgLow, letterSpacing:3, marginBottom:10 }}>BEST</p>
+              <div style={{ display:"flex", flexDirection:"column", gap:6, width:"100%", maxWidth:320, marginBottom:20 }}>
+                {modes.map((m) => {
+                  const b = bests[m];
+                  const [secondVal, secondLbl] = modeSecondary(m);
+                  return (
+                    <div key={m} style={{
+                      display:"flex", justifyContent:"space-between", alignItems:"center",
+                      padding:"10px 12px", border:`1px solid ${t.fgFaint}`,
+                    }}>
+                      <div style={{ display:"flex", flexDirection:"column", gap:4, minWidth:56 }}>
+                        <span style={{ fontSize:8, color:t.fgMid, letterSpacing:2 }}>{MODE_LABEL[m]}</span>
+                        <span style={{ fontSize:7, color:t.fgLow, letterSpacing:2 }}>{b.count} PLAY{b.count === 1 ? "" : "S"}</span>
+                      </div>
+                      <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:4 }}>
+                        <span style={{ fontSize:14 }}>{b.bestScore}</span>
+                        <span style={{ fontSize:7, color:t.fgLow, letterSpacing:2 }}>BEST · {secondVal} {secondLbl}</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              <p style={{ fontSize:7, color:t.fgLow, letterSpacing:3, marginBottom:10 }}>RECENT</p>
+              <div style={{
+                width:"100%", maxWidth:320, flex:1,
+                overflowY:"auto", display:"flex", flexDirection:"column",
+              }}>
+                {history.map((r) => (
+                  <div key={r.id} style={{
+                    display:"flex", justifyContent:"space-between", alignItems:"center",
+                    padding:"8px 10px", borderBottom:`1px solid ${t.fgSubtle}`,
+                  }}>
+                    <div style={{ display:"flex", flexDirection:"column", gap:3, minWidth:48 }}>
+                      <span style={{ fontSize:8, color:t.fgMid, letterSpacing:2 }}>{MODE_LABEL[r.mode] ?? r.mode.toUpperCase()}</span>
+                      <span style={{ fontSize:6, color:t.fgLow, letterSpacing:2 }}>{timeAgo(r.ts)} AGO</span>
+                    </div>
+                    <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:3 }}>
+                      <span style={{ fontSize:10 }}>{r.score}</span>
+                      <span style={{ fontSize:6, color:t.fgLow, letterSpacing:2 }}>{secondaryStat(r)}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
+          <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:16, marginTop:20 }}>
+            <Btn label="BACK" onClick={() => { setConfirmClear(false); clearTimeout(confirmClearTimer.current); setScreen("settings"); }} theme={t} ghost />
+            {history.length > 0 && (
+              <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); handleClearHistory(); }}
+                style={{ fontSize:7, color: confirmClear ? "#f87171" : t.fgLow, letterSpacing:2, cursor:"pointer", WebkitTapHighlightColor:"transparent", touchAction:"manipulation" }}>
+                {confirmClear ? "TAP AGAIN TO CONFIRM" : "CLEAR HISTORY"}
+              </div>
+            )}
+          </div>
         </div>
       </div>
     );
