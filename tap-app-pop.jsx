@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react";
+import { Fragment, useState, useEffect, useRef, useCallback, useMemo } from "react";
 
 // ============================================================
 // Audio Engine — Web Audio API chiptune synth, zero audio files
@@ -144,6 +144,10 @@ const rgbDifficulty = (pressure) => {
 const SCORE_MAX = 100;
 const SCORE_MIN = 5;
 const RGB_MAX_LIVES = 5;
+
+// Combo-based multiplier: shared across modes; in RGB it drives scoring.
+// combo 0-4 -> x1.00, 5-9 -> x1.25, ..., 25-29 -> x2.25, 30+ -> x2.50
+const comboMultiplier = (combo) => 1 + Math.min(Math.floor(combo / 5) * 0.25, 1.5);
 
 // MATH mode
 const MATH_MAX_LIVES = 5;
@@ -386,18 +390,22 @@ function Lives({ lives, max }) {
   );
 }
 
-function SequenceIndicator({ nextIndex, theme }) {
+function SequenceIndicator({ nextIndex, missedStep, theme }) {
+  const missScale = missedStep === 0 ? 1 : missedStep === 1 ? 0.6 : 0.2;
   return (
     <div style={{ display:"flex", gap:10, alignItems:"center" }}>
-      {RGB_COLORS.map((c, i) => (
-        <div key={c.name} style={{
-          width: 12, height: 12, borderRadius: 2,
-          backgroundColor: c.color,
-          opacity: i === nextIndex ? 1 : 0.2,
-          transition: "opacity 0.15s",
-          transform: i === nextIndex ? "scale(1.3)" : "scale(1)",
-        }} />
-      ))}
+      {RGB_COLORS.map((c, i) => {
+        const isNext = i === nextIndex;
+        return (
+          <div key={c.name} style={{
+            width: 12, height: 12, borderRadius: 2,
+            backgroundColor: c.color,
+            opacity: isNext ? 1 : 0.2,
+            transition: "opacity 0.15s, transform 0.18s ease-out",
+            transform: isNext ? `scale(${1.3 * missScale})` : "scale(1)",
+          }} />
+        );
+      })}
     </div>
   );
 }
@@ -461,9 +469,18 @@ export default function TapAppPop() {
   const [rgbChains, setRgbChains] = useState(0);
   const [pressure, setPressure] = useState(0);
   const [peakPressure, setPeakPressure] = useState(0);
+  const [missed, setMissed] = useState(0);
   // MATH state
   const [mathNext, setMathNext] = useState(1);
   const [mathRounds, setMathRounds] = useState(0);
+  // Combo & FX state
+  const [combo, setCombo] = useState(0);
+  const [comboBump, setComboBump] = useState(0);
+  const [particles, setParticles] = useState([]);
+  const [shake, setShake] = useState(0);
+  // Tap-feedback FX: per-tap squash/glow ghosts and full-screen flashes
+  const [tapPops, setTapPops] = useState([]);
+  const [flashes, setFlashes] = useState([]);
   // History
   const [history, setHistory] = useState(() => loadHistory().runs);
   const [confirmClear, setConfirmClear] = useState(false);
@@ -473,6 +490,7 @@ export default function TapAppPop() {
   const markBirths = useRef({});
   const markColors = useRef({});
   const markLabels = useRef({});
+  const markPositions = useRef({});
   const mathRoundRef = useRef(0);
   const mathCounterRef = useRef(1); // running number counter, resets on life loss
   const mathTimers = useRef([]);
@@ -481,9 +499,77 @@ export default function TapAppPop() {
   const gameTimer = useRef();
   const livesRef = useRef(RGB_MAX_LIVES);
   const pressureRef = useRef(0);
+  const comboRef = useRef(0);
+  const rgbNextRef = useRef(0);
+  const missedRef = useRef(0);
+  const mathNextRef = useRef(1);
   const t = themes[mode];
 
   const cleanup = () => { clearTimeout(spawnTimer.current); clearInterval(gameTimer.current); mathTimers.current.forEach(clearTimeout); mathTimers.current = []; };
+
+  // --- Combo + particle + shake helpers ---
+  const resetCombo = () => {
+    if (comboRef.current === 0) return;
+    comboRef.current = 0;
+    setCombo(0);
+  };
+  const triggerShake = () => setShake((s) => s + 1);
+  // gravity (px) is added to each particle's final dy so they drift slightly downward
+  // as they fade — a hint of weight without a per-frame physics loop.
+  const spawnParticles = (x, y, color, count, spread, gravity = 0) => {
+    const batchId = Date.now() + Math.random();
+    const batch = Array.from({ length: count }).map((_, i) => {
+      const angle = (i / count) * Math.PI * 2 + Math.random() * 0.5;
+      const dist = spread * (0.6 + Math.random() * 0.4);
+      const accent = Math.random();
+      return {
+        id: `${batchId}-${i}`,
+        batchId,
+        x, y,
+        dx: Math.cos(angle) * dist,
+        dy: Math.sin(angle) * dist + gravity,
+        color: accent < 0.25 ? "#ffffff" : accent < 0.5 ? "#fbbf24" : color,
+        size: 2 + Math.floor(Math.random() * 2),
+      };
+    });
+    setParticles((p) => [...p, ...batch]);
+    setTimeout(() => {
+      setParticles((p) => p.filter((pp) => pp.batchId !== batchId));
+    }, 450);
+  };
+  // ──────────────────────────────────────────────────────────────────────────
+  // Reusable per-tap visual feedback. Fires for every successful tap in any mode.
+  // Tweak the constants below to dial intensity up/down. Total duration < 400ms.
+  //   • squash & stretch ghost     — `tapPop`     (150ms)
+  //   • rim glow ring              — `tapGlow`    (200ms)
+  //   • particle burst (with grav) — spawnParticles (~450ms)
+  //   • subtle full-screen flash   — `flashFade`  (150ms)
+  // ──────────────────────────────────────────────────────────────────────────
+  const playTapFeedback = (x, y, color, label) => {
+    const id = Date.now() + Math.random();
+    // Ghost mark + rim glow share an entry so they animate together.
+    const popEntry = { id, x, y, color, label };
+    setTapPops((p) => [...p, popEntry]);
+    setTimeout(() => setTapPops((p) => p.filter((pp) => pp.id !== id)), 220);
+    // Particles: 14 dots in a ring with a small downward drift so they feel weighty.
+    spawnParticles(x, y, color, 14, 38, 6);
+    // Full-screen color flash — extremely subtle (opacity 0.06, fades in ~150ms).
+    const flashId = id + 0.5;
+    setFlashes((f) => [...f, { id: flashId, color }]);
+    setTimeout(() => setFlashes((f) => f.filter((ff) => ff.id !== flashId)), 160);
+  };
+
+  // Bumps combo (RGB only), triggers bump animation, fires milestone burst + shake at x2.00/x2.50.
+  const bumpCombo = (x, y, markColor) => {
+    comboRef.current += 1;
+    const newCombo = comboRef.current;
+    setCombo(newCombo);
+    setComboBump((b) => b + 1);
+    if (newCombo === 20 || newCombo === 30) {
+      spawnParticles(x, y, markColor, 40, 120);
+      triggerShake();
+    }
+  };
 
   // --- Classic spawning ---
   const spawnClassicMark = useCallback(() => {
@@ -491,17 +577,19 @@ export default function TapAppPop() {
     const diff = classicDifficulty(elapsed);
     const id = Date.now() + Math.random();
     const shape = Math.floor(Math.random() * markShapes.length);
+    // Compute position OUTSIDE setMarks so StrictMode's double-invocation of the
+    // updater can't advance spawnIndex twice (which would desync markPositions from the rendered mark).
+    const pos = randomPos(Object.values(markPositions.current));
+    markPositions.current[id] = pos;
     markBirths.current[id] = Date.now();
-    setMarks((prev) => {
-      const pos = randomPos(prev);
-      return [...prev, { id, ...pos, lifetime: diff.lifetime, shape }];
-    });
+    setMarks((prev) => [...prev, { id, ...pos, lifetime: diff.lifetime, shape }]);
     setTimeout(() => {
       setMarks((prev) => {
         if (prev.find((m) => m.id === id)) { setMisses((m) => m + 1); audio.sfxMiss(); }
         return prev.filter((m) => m.id !== id);
       });
       delete markBirths.current[id];
+      delete markPositions.current[id];
     }, diff.lifetime);
   }, []);
 
@@ -516,18 +604,43 @@ export default function TapAppPop() {
   const spawnRgbMark = useCallback(() => {
     const id = Date.now() + Math.random();
     const shape = Math.floor(Math.random() * markShapes.length);
-    const colorIdx = Math.floor(Math.random() * 3);
+    // Guarantee the currently-expected color stays reachable: if none is on screen,
+    // force this spawn to be that color. Otherwise random.
+    const expected = rgbNextRef.current;
+    const hasExpectedOnScreen = Object.values(markColors.current).includes(expected);
+    const colorIdx = hasExpectedOnScreen ? Math.floor(Math.random() * 3) : expected;
     const diff = rgbDifficulty(pressureRef.current);
+    // Compute position OUTSIDE setMarks for StrictMode safety (see Classic spawn).
+    const pos = randomPos(Object.values(markPositions.current));
+    markPositions.current[id] = pos;
     markBirths.current[id] = Date.now();
     markColors.current[id] = colorIdx;
-    setMarks((prev) => {
-      const pos = randomPos(prev);
-      return [...prev, { id, ...pos, lifetime: diff.lifetime, shape }];
-    });
+    setMarks((prev) => [...prev, { id, ...pos, lifetime: diff.lifetime, shape }]);
     setTimeout(() => {
+      const wasExpected = markColors.current[id] === rgbNextRef.current;
       setMarks((prev) => prev.filter((m) => m.id !== id));
       delete markBirths.current[id];
       delete markColors.current[id];
+      delete markPositions.current[id];
+
+      if (wasExpected && livesRef.current > 0) {
+        missedRef.current += 1;
+        if (missedRef.current >= 3) {
+          missedRef.current = 0;
+          setMissed(0);
+          resetCombo();
+          livesRef.current -= 1;
+          audio.sfxLifeLost();
+          setLives(livesRef.current);
+          if (livesRef.current <= 0) {
+            cleanup();
+            audio.sfxGameOver();
+            setTimeout(() => setScreen("end"), 400);
+          }
+        } else {
+          setMissed(missedRef.current);
+        }
+      }
     }, diff.lifetime);
   }, []);
 
@@ -541,8 +654,9 @@ export default function TapAppPop() {
 
   // --- Start games ---
   const startClassic = useCallback(() => {
-    setScore(0); setMarks([]); setFloats([]); setTaps(0); setMisses(0);
-    setTimeLeft(GAME_DURATION); markBirths.current = {}; spawnIndex = 0; setGameMode("classic"); setScreen("play");
+    setScore(0); setMarks([]); setFloats([]); setParticles([]); setTapPops([]); setFlashes([]); setTaps(0); setMisses(0);
+    setCombo(0); comboRef.current = 0;
+    setTimeLeft(GAME_DURATION); markBirths.current = {}; markPositions.current = {}; spawnIndex = 0; setGameMode("classic"); setScreen("play");
     classicStartRef.current = Date.now();
     scheduleClassic();
     gameTimer.current = setInterval(() => {
@@ -554,9 +668,11 @@ export default function TapAppPop() {
   }, [scheduleClassic]);
 
   const startRgb = useCallback(() => {
-    setScore(0); setMarks([]); setFloats([]); setTaps(0); setMisses(0);
+    setScore(0); setMarks([]); setFloats([]); setParticles([]); setTapPops([]); setFlashes([]); setTaps(0); setMisses(0);
+    setCombo(0); comboRef.current = 0;
     setLives(RGB_MAX_LIVES); livesRef.current = RGB_MAX_LIVES;
-    setRgbNext(0); setRgbChains(0); setTimeLeft(0);
+    setRgbNext(0); rgbNextRef.current = 0; setRgbChains(0); setTimeLeft(0);
+    setMissed(0); missedRef.current = 0;
     setPressure(0); pressureRef.current = 0; setPeakPressure(0);
     markBirths.current = {}; markColors.current = {}; spawnIndex = 0;
     setGameMode("rgb"); setScreen("play");
@@ -569,24 +685,26 @@ export default function TapAppPop() {
     const batchSize = diff.batchSize;
     const startNum = mathCounterRef.current;
     setMathNext(startNum);
-    setMarks(() => {
-      const next = [];
-      for (let i = 0; i < batchSize; i++) {
-        const num = startNum + i;
-        const id = Date.now() + Math.random() + i;
-        const pos = randomPos(next);
-        const mark = { id, ...pos, lifetime: diff.lifetime, shape: 0 };
-        markBirths.current[id] = Date.now();
-        markLabels.current[id] = num;
-        next.push(mark);
-      }
-      return next;
-    });
+    mathNextRef.current = startNum;
+    // Compute positions OUTSIDE setMarks for StrictMode safety (see Classic spawn).
+    const placed = [];
+    const batchMarks = [];
+    for (let i = 0; i < batchSize; i++) {
+      const num = startNum + i;
+      const id = Date.now() + Math.random() + i;
+      const pos = randomPos(placed);
+      placed.push(pos);
+      markBirths.current[id] = Date.now();
+      markLabels.current[id] = num;
+      markPositions.current[id] = pos;
+      batchMarks.push({ id, ...pos, lifetime: diff.lifetime, shape: 0 });
+    }
+    setMarks(() => batchMarks);
     // single batch expiry — clear all remaining, lose a life, reset counter
     const timer = setTimeout(() => {
       setMarks((prev) => {
         if (prev.length === 0) return prev;
-        prev.forEach((m) => { delete markBirths.current[m.id]; delete markLabels.current[m.id]; });
+        prev.forEach((m) => { delete markBirths.current[m.id]; delete markLabels.current[m.id]; delete markPositions.current[m.id]; });
         return [];
       });
       mathCounterRef.current = 1;
@@ -603,10 +721,11 @@ export default function TapAppPop() {
   }, []);
 
   const startMath = useCallback(() => {
-    setScore(0); setMarks([]); setFloats([]); setTaps(0); setMisses(0);
+    setScore(0); setMarks([]); setFloats([]); setParticles([]); setTapPops([]); setFlashes([]); setTaps(0); setMisses(0);
+    setCombo(0); comboRef.current = 0;
     setLives(MATH_MAX_LIVES); livesRef.current = MATH_MAX_LIVES;
-    setMathNext(1); setMathRounds(0); mathRoundRef.current = 0; mathCounterRef.current = 1;
-    markBirths.current = {}; markLabels.current = {}; spawnIndex = 0;
+    setMathNext(1); mathNextRef.current = 1; setMathRounds(0); mathRoundRef.current = 0; mathCounterRef.current = 1;
+    markBirths.current = {}; markLabels.current = {}; markPositions.current = {}; spawnIndex = 0;
     mathTimers.current.forEach(clearTimeout); mathTimers.current = [];
     setGameMode("math"); setScreen("play");
     setTimeout(() => spawnMathBatch(), 100);
@@ -634,7 +753,9 @@ export default function TapAppPop() {
     const birth = markBirths.current[id];
     if (!birth) return;
     audio.sfxTap();
+    const pos = markPositions.current[id]; // captured before delete so visuals fire even after the mark is gone
     delete markBirths.current[id];
+    delete markPositions.current[id];
     setMarks((prev) => {
       const m = prev.find((mk) => mk.id === id);
       if (m) {
@@ -646,141 +767,158 @@ export default function TapAppPop() {
       }
       return prev.filter((mk) => mk.id !== id);
     });
-  }, []);
+    // Visual flair fires OUTSIDE the state updater so StrictMode double-invocation can't double the burst.
+    if (pos) playTapFeedback(pos.x, pos.y, t.fg);
+  }, [t.fg]);
 
   // --- RGB tap ---
   const handleRgbTap = useCallback((id) => {
     const birth = markBirths.current[id];
     if (birth == null) return;
     const colorIdx = markColors.current[id];
+    const pos = markPositions.current[id];
     delete markBirths.current[id];
     delete markColors.current[id];
+    delete markPositions.current[id];
 
-    setRgbNext((expected) => {
-      if (colorIdx === expected) {
-        // Correct tap — increase pressure
-        audio.sfxTap();
-        const diff = rgbDifficulty(pressureRef.current);
-        const pts = Math.round(scoreFromReaction(Date.now() - birth, diff.lifetime) * diff.multiplier);
-        const newP = Math.min(pressureRef.current + RGB_PRESSURE_PER_TAP, RGB_MAX_PRESSURE);
-        pressureRef.current = newP;
-        setPressure(newP);
-        setPeakPressure((prev) => Math.max(prev, newP));
-        setMarks((prev) => {
-          const m = prev.find((mk) => mk.id === id);
-          if (m) {
-            const label = diff.multiplier > 1 ? `+${pts} x${diff.multiplier.toFixed(2)}` : `+${pts}`;
-            setFloats((f) => [...f, { id: Date.now(), x: m.x, y: m.y, value: pts, text: label }]);
-            setTimeout(() => setFloats((f) => f.slice(1)), 700);
-          }
-          return prev.filter((mk) => mk.id !== id);
-        });
-        setScore((s) => s + pts);
-        setTaps((tt) => tt + 1);
-        const next = (expected + 1) % 3;
-        if (next === 0) { setRgbChains((c) => c + 1); audio.sfxChainComplete(); }
-        return next;
-      } else {
-        // Wrong tap — lose life, drop pressure, reset to R
-        audio.sfxMiss();
-        const newP = Math.max(pressureRef.current - RGB_PRESSURE_DROP, 0);
-        pressureRef.current = newP;
-        setPressure(newP);
-        setMarks((prev) => {
-          const m = prev.find((mk) => mk.id === id);
-          if (m) {
-            setFloats((f) => [...f, { id: Date.now(), x: m.x, y: m.y, value: 0, text: "X", color: "#ef4444" }]);
-            setTimeout(() => setFloats((f) => f.slice(1)), 700);
-          }
-          return prev.filter((mk) => mk.id !== id);
-        });
-        setLives((l) => {
-          const next = l - 1;
-          livesRef.current = next;
-          audio.sfxLifeLost();
-          if (next <= 0) {
-            cleanup();
-            audio.sfxGameOver();
-            setTimeout(() => setScreen("end"), 400);
-          }
-          return next;
-        });
-        return 0; // reset to R
+    const expected = rgbNextRef.current;
+    if (colorIdx === expected) {
+      // Correct tap — increase pressure and combo
+      audio.sfxTap();
+      const diff = rgbDifficulty(pressureRef.current);
+      const mult = comboMultiplier(comboRef.current);
+      const pts = Math.round(scoreFromReaction(Date.now() - birth, diff.lifetime) * mult);
+      const newP = Math.min(pressureRef.current + RGB_PRESSURE_PER_TAP, RGB_MAX_PRESSURE);
+      pressureRef.current = newP;
+      setPressure(newP);
+      setPeakPressure((prev) => Math.max(prev, newP));
+      const markColor = RGB_COLORS[colorIdx].color;
+      if (pos) {
+        const label = mult > 1 ? `+${pts} x${mult.toFixed(2)}` : `+${pts}`;
+        const floatId = Date.now() + Math.random();
+        setFloats((f) => [...f, { id: floatId, x: pos.x, y: pos.y, value: pts, text: label }]);
+        setTimeout(() => setFloats((f) => f.filter((ff) => ff.id !== floatId)), 700);
+        playTapFeedback(pos.x, pos.y, markColor); // shared tap-feedback (squash + glow + 14 particles + flash)
+        bumpCombo(pos.x, pos.y, markColor);
       }
-    });
+      setMarks((prev) => prev.filter((mk) => mk.id !== id));
+      setScore((s) => s + pts);
+      setTaps((tt) => tt + 1);
+      const next = (expected + 1) % 3;
+      rgbNextRef.current = next;
+      setRgbNext(next);
+      missedRef.current = 0;
+      setMissed(0);
+      if (next === 0) { setRgbChains((c) => c + 1); audio.sfxChainComplete(); }
+    } else {
+      // Wrong tap — lose life, drop pressure, reset combo, reset to R
+      audio.sfxMiss();
+      const newP = Math.max(pressureRef.current - RGB_PRESSURE_DROP, 0);
+      pressureRef.current = newP;
+      setPressure(newP);
+      resetCombo();
+      if (pos) {
+        const floatId = Date.now() + Math.random();
+        setFloats((f) => [...f, { id: floatId, x: pos.x, y: pos.y, value: 0, text: "X", color: "#ef4444" }]);
+        setTimeout(() => setFloats((f) => f.filter((ff) => ff.id !== floatId)), 700);
+      }
+      setMarks((prev) => prev.filter((mk) => mk.id !== id));
+      livesRef.current -= 1;
+      audio.sfxLifeLost();
+      const livesAfter = livesRef.current;
+      setLives(livesAfter);
+      if (livesAfter <= 0) {
+        cleanup();
+        audio.sfxGameOver();
+        setTimeout(() => setScreen("end"), 400);
+      }
+      rgbNextRef.current = 0;
+      setRgbNext(0);
+      missedRef.current = 0;
+      setMissed(0);
+    }
   }, []);
 
   // --- MATH tap ---
+  // Refactored from a setMathNext-updater pattern to ref-based reads so all
+  // side effects (audio, particles, playTapFeedback) fire exactly once per tap
+  // even under React StrictMode (which double-invokes state updaters).
   const handleMathTap = useCallback((id) => {
     const birth = markBirths.current[id];
     if (birth == null) return;
     const num = markLabels.current[id];
+    const pos = markPositions.current[id];
+    const expected = mathNextRef.current;
 
-    setMathNext((expected) => {
-      if (num === expected) {
-        // Correct
-        audio.sfxTap();
-        const diff = mathDifficulty(mathRoundRef.current);
-        const pts = scoreFromReaction(Date.now() - birth, diff.lifetime);
-        delete markBirths.current[id];
-        delete markLabels.current[id];
-        setMarks((prev) => {
-          const m = prev.find((mk) => mk.id === id);
-          if (m) {
-            setFloats((f) => [...f, { id: Date.now(), x: m.x, y: m.y, value: pts }]);
-            setTimeout(() => setFloats((f) => f.slice(1)), 700);
-          }
-          return prev.filter((mk) => mk.id !== id);
-        });
-        setScore((s) => s + pts);
-        setTaps((tt) => tt + 1);
-        const next = expected + 1;
-        const batchEnd = mathCounterRef.current + diff.batchSize;
-        if (next >= batchEnd) {
-          // Round complete
-          audio.sfxBatchComplete();
-          mathCounterRef.current = batchEnd;
-          mathRoundRef.current += 1;
-          setMathRounds((r) => r + 1);
-          mathTimers.current.forEach(clearTimeout);
-          mathTimers.current = [];
-          setTimeout(() => spawnMathBatch(), 400);
-          return batchEnd;
-        }
-        return next;
-      } else {
-        // Wrong tap — lose life, reset counter to 1
-        audio.sfxMiss();
-        mathCounterRef.current = 1;
-        setMarks((prev) => {
-          const m = prev.find((mk) => mk.id === id);
-          if (m) {
-            setFloats((f) => [...f, { id: Date.now(), x: m.x, y: m.y, value: 0, text: "X", color: "#ef4444" }]);
-            setTimeout(() => setFloats((f) => f.slice(1)), 700);
-          }
-          return [];
-        });
-        markBirths.current = {};
-        markLabels.current = {};
+    if (num === expected) {
+      // Correct tap
+      audio.sfxTap();
+      const diff = mathDifficulty(mathRoundRef.current);
+      const pts = scoreFromReaction(Date.now() - birth, diff.lifetime);
+      delete markBirths.current[id];
+      delete markLabels.current[id];
+      delete markPositions.current[id];
+
+      if (pos) {
+        const floatId = Date.now() + Math.random();
+        setFloats((f) => [...f, { id: floatId, x: pos.x, y: pos.y, value: pts }]);
+        setTimeout(() => setFloats((f) => f.filter((ff) => ff.id !== floatId)), 700);
+      }
+      setMarks((prev) => prev.filter((mk) => mk.id !== id));
+      setScore((s) => s + pts);
+      setTaps((tt) => tt + 1);
+
+      const next = expected + 1;
+      const batchEnd = mathCounterRef.current + diff.batchSize;
+      if (next >= batchEnd) {
+        // Round complete — schedule the next batch
+        audio.sfxBatchComplete();
+        mathCounterRef.current = batchEnd;
+        mathRoundRef.current += 1;
+        setMathRounds((r) => r + 1);
         mathTimers.current.forEach(clearTimeout);
         mathTimers.current = [];
-        setLives((l) => {
-          const next = l - 1;
-          livesRef.current = next;
-          audio.sfxLifeLost();
-          if (next <= 0) {
-            cleanup();
-            audio.sfxGameOver();
-            setTimeout(() => setScreen("end"), 400);
-          } else {
-            setTimeout(() => spawnMathBatch(), 400);
-          }
-          return next;
-        });
-        return 1;
+        setTimeout(() => spawnMathBatch(), 400);
+        mathNextRef.current = batchEnd;
+        setMathNext(batchEnd);
+      } else {
+        mathNextRef.current = next;
+        setMathNext(next);
       }
-    });
-  }, [spawnMathBatch]);
+
+      // Visual flair for the successful tap (outside of any state updater).
+      if (pos) playTapFeedback(pos.x, pos.y, t.fg, num);
+    } else {
+      // Wrong tap — clear batch, lose a life, reset counter
+      audio.sfxMiss();
+      mathCounterRef.current = 1;
+      if (pos) {
+        const floatId = Date.now() + Math.random();
+        setFloats((f) => [...f, { id: floatId, x: pos.x, y: pos.y, value: 0, text: "X", color: "#ef4444" }]);
+        setTimeout(() => setFloats((f) => f.filter((ff) => ff.id !== floatId)), 700);
+      }
+      setMarks([]);
+      markBirths.current = {};
+      markLabels.current = {};
+      markPositions.current = {};
+      mathTimers.current.forEach(clearTimeout);
+      mathTimers.current = [];
+
+      livesRef.current -= 1;
+      audio.sfxLifeLost();
+      const livesAfter = livesRef.current;
+      setLives(livesAfter);
+      if (livesAfter <= 0) {
+        cleanup();
+        audio.sfxGameOver();
+        setTimeout(() => setScreen("end"), 400);
+      } else {
+        setTimeout(() => spawnMathBatch(), 400);
+      }
+      mathNextRef.current = 1;
+      setMathNext(1);
+    }
+  }, [spawnMathBatch, t.fg]);
 
   const handleTap = gameMode === "math" ? handleMathTap : gameMode === "rgb" ? handleRgbTap : handleClassicTap;
 
@@ -799,6 +937,15 @@ export default function TapAppPop() {
     @keyframes pulse { 0%,100% { opacity:0.3; } 50% { opacity:0.6; } }
     @keyframes shake { 0%,100% { transform:translateX(0); } 20% { transform:translateX(-4px); } 40% { transform:translateX(4px); } 60% { transform:translateX(-3px); } 80% { transform:translateX(3px); } }
     @keyframes squarePulse { 0% { opacity:0; transform:translate(-50%,-50%) scale(0.5); } 20% { opacity:0.18; transform:translate(-50%,-50%) scale(1); } 80% { opacity:0.18; transform:translate(-50%,-50%) scale(1); } 100% { opacity:0; transform:translate(-50%,-50%) scale(0.5); } }
+    @keyframes comboPop { 0% { transform:scale(1); } 40% { transform:scale(1.25); } 100% { transform:scale(1); } }
+    @keyframes particleFly { 0% { transform:translate(-50%,-50%); opacity:1; } 100% { transform:translate(calc(-50% + var(--dx)), calc(-50% + var(--dy))); opacity:0; } }
+    @keyframes screenShake { 0% { transform:translate(0,0); } 20% { transform:translate(-6px,3px); } 40% { transform:translate(5px,-4px); } 60% { transform:translate(-4px,2px); } 80% { transform:translate(3px,-3px); } 100% { transform:translate(0,0); } }
+    /* Tap feedback: quick squash & stretch ghost (replaces the tapped mark briefly). */
+    @keyframes tapPop { 0% { transform:translate(-50%,-50%) scale(1); opacity:1; } 15% { transform:translate(-50%,-50%) scale(0.7); opacity:0.95; } 60% { transform:translate(-50%,-50%) scale(1.1); opacity:0.55; } 100% { transform:translate(-50%,-50%) scale(1.0); opacity:0; } }
+    /* Tap feedback: short rim glow expanding outward from the tap point. */
+    @keyframes tapGlow { 0% { transform:translate(-50%,-50%) scale(1); opacity:0.6; } 100% { transform:translate(-50%,-50%) scale(1.6); opacity:0; } }
+    /* Tap feedback: extremely subtle full-screen colored flash. */
+    @keyframes flashFade { 0% { opacity:0.06; } 100% { opacity:0; } }
   `;
 
   const [muted, setMuted] = useState(false);
@@ -1043,7 +1190,14 @@ export default function TapAppPop() {
       <style>{globalStyles}</style>
       {/* HUD */}
       <div style={{ position:"absolute", top:0, left:0, right:0, display:"flex", justifyContent:"space-between", alignItems:"flex-start", padding:"52px 20px 0", zIndex:10, pointerEvents:"none" }}>
-        <span style={{ fontSize:14, letterSpacing:2 }}>{score}</span>
+        <div style={{ display:"flex", flexDirection:"column", gap:6 }}>
+          <span style={{ fontSize:14, letterSpacing:2 }}>{score}</span>
+          {isRgb && combo >= 2 && (
+            <span key={comboBump} style={{ fontSize:16, letterSpacing:2, color:"#fbbf24", animation:"comboPop 0.18s ease-out" }}>
+              {combo}×
+            </span>
+          )}
+        </div>
         {isMathPlay ? (
           <div style={{ display:"flex", alignItems:"center", gap:16 }}>
             <span style={{ fontSize:9, color:t.fgMid, letterSpacing:1 }}>NEXT: {mathNext}</span>
@@ -1051,12 +1205,12 @@ export default function TapAppPop() {
           </div>
         ) : isRgb ? (
           <div style={{ display:"flex", alignItems:"center", gap:16 }}>
-            {rgbDifficulty(pressure).multiplier > 1 && (
+            {comboMultiplier(combo) > 1 && (
               <span style={{ fontSize:9, color:"#fbbf24", letterSpacing:1 }}>
-                x{rgbDifficulty(pressure).multiplier.toFixed(2)}
+                x{comboMultiplier(combo).toFixed(2)}
               </span>
             )}
-            <SequenceIndicator nextIndex={rgbNext} theme={t} />
+            <SequenceIndicator nextIndex={rgbNext} missedStep={missed} theme={t} />
             <Lives lives={lives} max={RGB_MAX_LIVES} />
           </div>
         ) : (
@@ -1085,7 +1239,7 @@ export default function TapAppPop() {
       )}
 
       {/* Canvas */}
-      <div style={{ position:"absolute", inset:0, top:96, bottom:0 }}>
+      <div key={`canvas-${shake}`} style={{ position:"absolute", inset:0, top:96, bottom:0, animation: shake > 0 ? "screenShake 0.18s ease-out" : undefined }}>
         {marks.map((m) => (
           <Mark key={m.id} mark={m} onTap={handleTap} theme={t}
             rgbColor={isRgb ? RGB_COLORS[markColors.current[m.id]]?.color : null}
@@ -1094,7 +1248,51 @@ export default function TapAppPop() {
         {floats.map((f) => (
           <FloatingText key={f.id} x={f.x} y={f.y} value={f.value} text={f.text} color={f.color} />
         ))}
+        {particles.map((p) => (
+          <span key={p.id} style={{
+            position:"absolute", left:`${p.x}%`, top:`${p.y}%`,
+            width:p.size, height:p.size, backgroundColor:p.color,
+            pointerEvents:"none",
+            ["--dx"]:`${p.dx}px`, ["--dy"]:`${p.dy}px`,
+            transform:"translate(-50%,-50%)",
+            animation:"particleFly 0.4s ease-out forwards",
+          }} />
+        ))}
+        {/* Tap-feedback ghosts: squashing square + expanding rim glow at the tapped position. */}
+        {tapPops.map((p) => (
+          <Fragment key={p.id}>
+            {/* Squash & stretch ghost — replaces the just-removed mark for ~150ms. */}
+            <div style={{
+              position:"absolute", left:`${p.x}%`, top:`${p.y}%`,
+              width:54, height:54, backgroundColor:p.color,
+              pointerEvents:"none",
+              transform:"translate(-50%,-50%)",
+              animation:"tapPop 0.15s ease-out forwards",
+              display:"flex", alignItems:"center", justifyContent:"center",
+            }}>
+              {p.label != null && (
+                <span style={{ fontSize:20, color:t.bg, fontFamily:"'Press Start 2P', monospace" }}>{p.label}</span>
+              )}
+            </div>
+            {/* Rim glow — outline ring expanding outward, fading to 0 in ~80–200ms. */}
+            <div style={{
+              position:"absolute", left:`${p.x}%`, top:`${p.y}%`,
+              width:54, height:54, border:`2px solid ${p.color}`,
+              pointerEvents:"none",
+              transform:"translate(-50%,-50%)",
+              animation:"tapGlow 0.2s ease-out forwards",
+            }} />
+          </Fragment>
+        ))}
       </div>
+      {/* Full-screen color flashes — extremely subtle (opacity 0.06), ~150ms each. */}
+      {flashes.map((f) => (
+        <div key={f.id} style={{
+          position:"absolute", inset:0,
+          backgroundColor:f.color, pointerEvents:"none", zIndex:5,
+          animation:"flashFade 0.15s ease-out forwards",
+        }} />
+      ))}
     </div>
   );
 }
