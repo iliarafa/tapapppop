@@ -204,6 +204,12 @@ function clearHistoryStorage() {
   } catch {}
 }
 
+function triggerHaptic(ms = 10) {
+  if (typeof navigator !== "undefined" && typeof navigator.vibrate === "function") {
+    try { navigator.vibrate(ms); } catch {}
+  }
+}
+
 function makeRunId() {
   if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
   return `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
@@ -265,6 +271,7 @@ function timeAgo(ts) {
 }
 
 const MODE_LABEL = { classic: "CLASSIC", rgb: "RBG", math: "MATH" };
+const MODES = ["classic", "rgb", "math"];
 
 const themes = {
   night: { bg: "#0a0a0a", fg: "#ffffff", fgMid: "rgba(255,255,255,0.5)", fgLow: "rgba(255,255,255,0.3)", fgFaint: "rgba(255,255,255,0.12)", fgSubtle: "rgba(255,255,255,0.08)", bar: "rgba(255,255,255,0.35)" },
@@ -486,6 +493,10 @@ export default function TapAppPop() {
   const [confirmClear, setConfirmClear] = useState(false);
   const confirmClearTimer = useRef();
   const bests = useMemo(() => computeBests(history), [history]);
+  const [selectedMode, setSelectedMode] = useState("classic");
+  const [dragDx, setDragDx] = useState(0);
+  const [dragging, setDragging] = useState(false);
+  const dragRef = useRef({ pointerId: null, startX: 0, startIndex: 0, lastSnappedIndex: 0 });
 
   const markBirths = useRef({});
   const markColors = useRef({});
@@ -1024,10 +1035,18 @@ export default function TapAppPop() {
 
   // ===== HISTORY =====
   if (screen === "history") {
+    const ITEM_W = 160;
+    const VIEWPORT_W = 160;
+    const baseOffset = 0;
+    const selectedIndex = MODES.indexOf(selectedMode);
+    const modeRuns = history.filter((r) => r.mode === selectedMode);
+    const b = bests[selectedMode];
+
     const handleClearHistory = () => {
       if (confirmClear) {
-        clearHistoryStorage();
-        setHistory([]);
+        const remaining = history.filter((r) => r.mode !== selectedMode);
+        saveHistory({ version: 1, runs: remaining });
+        setHistory(remaining);
         setConfirmClear(false);
         clearTimeout(confirmClearTimer.current);
       } else {
@@ -1042,77 +1061,135 @@ export default function TapAppPop() {
       if (r.mode === "math") return `R ${r.mathRounds ?? 0}`;
       return "";
     };
-    const modes = ["classic", "rgb", "math"];
-    const modeSecondary = (m) => {
-      if (m === "classic") return [`${bests.classic.bestAccuracy}%`, "BEST ACC"];
-      if (m === "rgb") return [`x${bests.rgb.peakMultiplier.toFixed(2)}`, "PEAK"];
-      return [`${bests.math.mostRounds}`, "ROUNDS"];
+
+    const onCarouselDown = (e) => {
+      e.preventDefault();
+      e.currentTarget.setPointerCapture(e.pointerId);
+      dragRef.current = {
+        pointerId: e.pointerId,
+        startX: e.clientX,
+        startIndex: selectedIndex,
+        lastSnappedIndex: selectedIndex,
+      };
+      setDragging(true);
+      setDragDx(0);
     };
+    const onCarouselMove = (e) => {
+      const r = dragRef.current;
+      if (r.pointerId !== e.pointerId) return;
+      const dx = e.clientX - r.startX;
+      setDragDx(dx);
+      const raw = r.startIndex - dx / ITEM_W;
+      const nearest = Math.max(0, Math.min(MODES.length - 1, Math.round(raw)));
+      if (nearest !== r.lastSnappedIndex) {
+        r.lastSnappedIndex = nearest;
+        triggerHaptic();
+      }
+    };
+    const onCarouselUp = (e) => {
+      const r = dragRef.current;
+      if (r.pointerId !== e.pointerId) return;
+      const finalIndex = r.lastSnappedIndex;
+      dragRef.current.pointerId = null;
+      setDragging(false);
+      setDragDx(0);
+      if (MODES[finalIndex] !== selectedMode) setSelectedMode(MODES[finalIndex]);
+    };
+
+    const bestSecondary = selectedMode === "classic"
+      ? [["ACC", `${b.bestAccuracy}%`], ["PLAYS", `${b.count}`]]
+      : selectedMode === "rgb"
+        ? [["CHAINS", `${b.mostChains}`], ["PEAK", `x${b.peakMultiplier.toFixed(2)}`], ["PLAYS", `${b.count}`]]
+        : [["ROUNDS", `${b.mostRounds}`], ["PLAYS", `${b.count}`]];
+
     return (
       <div style={base}>
         <style>{globalStyles}</style>
         <div style={{ display:"flex", flexDirection:"column", alignItems:"center", height:"100%", padding:"52px 20px 24px", boxSizing:"border-box" }}>
-          <p style={{ fontSize:12, letterSpacing:4, marginBottom:24 }}>HISTORY</p>
+          <p style={{ fontSize:12, letterSpacing:4, marginBottom:20 }}>HISTORY</p>
 
-          {history.length === 0 ? (
-            <div style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"center" }}>
-              <span style={{ fontSize:9, color:t.fgLow, letterSpacing:3 }}>NO RUNS YET</span>
-            </div>
-          ) : (
-            <>
-              <p style={{ fontSize:7, color:t.fgLow, letterSpacing:3, marginBottom:10 }}>BEST</p>
-              <div style={{ display:"flex", flexDirection:"column", gap:6, width:"100%", maxWidth:320, marginBottom:20 }}>
-                {modes.map((m) => {
-                  const b = bests[m];
-                  const [secondVal, secondLbl] = modeSecondary(m);
-                  return (
-                    <div key={m} style={{
-                      display:"flex", justifyContent:"space-between", alignItems:"center",
-                      padding:"10px 12px", border:`1px solid ${t.fgFaint}`,
-                    }}>
-                      <div style={{ display:"flex", flexDirection:"column", gap:4, minWidth:56 }}>
-                        <span style={{ fontSize:8, color:t.fgMid, letterSpacing:2 }}>{MODE_LABEL[m]}</span>
-                        <span style={{ fontSize:7, color:t.fgLow, letterSpacing:2 }}>{b.count} PLAY{b.count === 1 ? "" : "S"}</span>
-                      </div>
-                      <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:4 }}>
-                        <span style={{ fontSize:14 }}>{b.bestScore}</span>
-                        <span style={{ fontSize:7, color:t.fgLow, letterSpacing:2 }}>BEST · {secondVal} {secondLbl}</span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-
-              <p style={{ fontSize:7, color:t.fgLow, letterSpacing:3, marginBottom:10 }}>RECENT</p>
-              <div style={{
-                width:"100%", maxWidth:320, flex:1,
-                overflowY:"auto", display:"flex", flexDirection:"column",
-              }}>
-                {history.map((r) => (
-                  <div key={r.id} style={{
-                    display:"flex", justifyContent:"space-between", alignItems:"center",
-                    padding:"8px 10px", borderBottom:`1px solid ${t.fgSubtle}`,
+          <div
+            onPointerDown={onCarouselDown}
+            onPointerMove={onCarouselMove}
+            onPointerUp={onCarouselUp}
+            onPointerCancel={onCarouselUp}
+            style={{
+              width: VIEWPORT_W, height: 40, overflow: "hidden", position: "relative",
+              touchAction: "pan-y", cursor: "grab", WebkitTapHighlightColor: "transparent",
+              userSelect: "none", marginBottom: 20,
+            }}
+          >
+            <div style={{
+              display: "flex", width: MODES.length * ITEM_W, height: "100%", alignItems: "center",
+              transform: `translateX(${baseOffset - selectedIndex * ITEM_W + dragDx}px)`,
+              transition: dragging ? "none" : "transform 180ms cubic-bezier(.2,.8,.2,1)",
+            }}>
+              {MODES.map((m) => (
+                <div key={m}
+                  onClick={() => { if (!dragging && m !== selectedMode) { triggerHaptic(); setSelectedMode(m); } }}
+                  style={{
+                    width: ITEM_W, textAlign: "center", fontSize: 12, letterSpacing: 4,
+                    color: m === selectedMode ? t.fg : t.fgLow,
+                    transition: "color 180ms",
                   }}>
-                    <div style={{ display:"flex", flexDirection:"column", gap:3, minWidth:48 }}>
-                      <span style={{ fontSize:8, color:t.fgMid, letterSpacing:2 }}>{MODE_LABEL[r.mode] ?? r.mode.toUpperCase()}</span>
-                      <span style={{ fontSize:6, color:t.fgLow, letterSpacing:2 }}>{timeAgo(r.ts)} AGO</span>
-                    </div>
-                    <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:3 }}>
-                      <span style={{ fontSize:10 }}>{r.score}</span>
-                      <span style={{ fontSize:6, color:t.fgLow, letterSpacing:2 }}>{secondaryStat(r)}</span>
-                    </div>
-                  </div>
-                ))}
+                  {MODE_LABEL[m]}
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <p style={{ fontSize:7, color:t.fgLow, letterSpacing:3, marginBottom:10 }}>BEST</p>
+          <div style={{
+            display:"flex", flexDirection:"column", gap:10, width:"100%", maxWidth:320, marginBottom:20,
+            padding:"14px 14px", border:`1px solid ${t.fgFaint}`,
+          }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline" }}>
+              <span style={{ fontSize:8, color:t.fgMid, letterSpacing:2 }}>{MODE_LABEL[selectedMode]}</span>
+              <span style={{ fontSize:22 }}>{b.bestScore}</span>
+            </div>
+            <div style={{ height:1, background:t.fgFaint }} />
+            <div style={{ display:"flex", justifyContent:"space-between", gap:8 }}>
+              {bestSecondary.map(([lbl, val]) => (
+                <div key={lbl} style={{ display:"flex", flexDirection:"column", gap:3, alignItems:"flex-start", flex:1 }}>
+                  <span style={{ fontSize:6, color:t.fgLow, letterSpacing:2 }}>{lbl}</span>
+                  <span style={{ fontSize:10, color:t.fg, letterSpacing:1 }}>{val}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <p style={{ fontSize:7, color:t.fgLow, letterSpacing:3, marginBottom:10 }}>RECENT</p>
+          <div style={{
+            width:"100%", maxWidth:320, flex:1,
+            overflowY:"auto", display:"flex", flexDirection:"column",
+          }}>
+            {modeRuns.length === 0 ? (
+              <div style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"center", padding:"20px 0" }}>
+                <span style={{ fontSize:9, color:t.fgLow, letterSpacing:3 }}>NO {MODE_LABEL[selectedMode]} RUNS YET</span>
               </div>
-            </>
-          )}
+            ) : modeRuns.map((r) => (
+              <div key={r.id} style={{
+                display:"flex", justifyContent:"space-between", alignItems:"center",
+                padding:"8px 10px", borderBottom:`1px solid ${t.fgSubtle}`,
+              }}>
+                <div style={{ display:"flex", flexDirection:"column", gap:3, minWidth:48 }}>
+                  <span style={{ fontSize:8, color:t.fgMid, letterSpacing:2 }}>{MODE_LABEL[r.mode] ?? r.mode.toUpperCase()}</span>
+                  <span style={{ fontSize:6, color:t.fgLow, letterSpacing:2 }}>{timeAgo(r.ts)} AGO</span>
+                </div>
+                <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:3 }}>
+                  <span style={{ fontSize:10 }}>{r.score}</span>
+                  <span style={{ fontSize:6, color:t.fgLow, letterSpacing:2 }}>{secondaryStat(r)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
 
           <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:16, marginTop:20 }}>
             <Btn label="BACK" onClick={() => { setConfirmClear(false); clearTimeout(confirmClearTimer.current); setScreen("settings"); }} theme={t} ghost />
-            {history.length > 0 && (
+            {modeRuns.length > 0 && (
               <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); handleClearHistory(); }}
                 style={{ fontSize:7, color: confirmClear ? "#f87171" : t.fgLow, letterSpacing:2, cursor:"pointer", WebkitTapHighlightColor:"transparent", touchAction:"manipulation" }}>
-                {confirmClear ? "TAP AGAIN TO CONFIRM" : "CLEAR HISTORY"}
+                {confirmClear ? "TAP AGAIN TO CONFIRM" : `CLEAR ${MODE_LABEL[selectedMode]} RUNS`}
               </div>
             )}
           </div>
