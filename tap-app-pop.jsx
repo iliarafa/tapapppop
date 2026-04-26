@@ -149,13 +149,13 @@ const RGB_MAX_LIVES = 5;
 // combo 0-4 -> x1.00, 5-9 -> x1.25, ..., 25-29 -> x2.25, 30+ -> x2.50
 const comboMultiplier = (combo) => 1 + Math.min(Math.floor(combo / 5) * 0.25, 1.5);
 
-// MATH mode
-const MATH_MAX_LIVES = 5;
-const MATH_BATCH_SIZE = 5;
-const MATH_BASE_LIFETIME = 4000;
-const mathDifficulty = (round) => ({
-  lifetime: Math.max(1500, MATH_BASE_LIFETIME - round * 200),
-  batchSize: Math.min(MATH_BATCH_SIZE + Math.floor(round / 3), 9),
+// MEMORY mode — preview the numbers, flip face-down, tap in ascending order.
+const MEMORY_MAX_LIVES = 5;
+const MEMORY_FLIP_MS = 320;
+const memoryDifficulty = (round) => ({
+  tileCount: Math.min(5 + Math.floor(round / 2), 9),     // 5,5,6,6,7,7,8,8,9...
+  previewMs: Math.max(800, 2000 - round * 150),           // 2000ms → 800ms
+  lifetime:  Math.max(4000, 8000 - round * 400),          // post-flip time budget
 });
 
 const RGB_COLORS = [
@@ -231,9 +231,9 @@ function buildRun(mode, stats) {
       peakMultiplier: rgbDifficulty(stats.peakPressure).multiplier,
     };
   }
-  if (mode === "math") {
+  if (mode === "memory") {
     const avg = stats.taps > 0 ? Math.round(stats.score / stats.taps) : 0;
-    return { ...base, mathRounds: stats.mathRounds, avg };
+    return { ...base, memoryRounds: stats.memoryRounds, avg };
   }
   return base;
 }
@@ -242,7 +242,7 @@ function computeBests(runs) {
   const result = {
     classic: { count: 0, bestScore: 0, bestAccuracy: 0 },
     rgb: { count: 0, bestScore: 0, mostChains: 0, peakMultiplier: 1 },
-    math: { count: 0, bestScore: 0, mostRounds: 0 },
+    memory: { count: 0, bestScore: 0, mostRounds: 0 },
   };
   for (const r of runs) {
     const b = result[r.mode];
@@ -254,7 +254,7 @@ function computeBests(runs) {
       if ((r.rgbChains || 0) > b.mostChains) b.mostChains = r.rgbChains;
       if ((r.peakMultiplier || 1) > b.peakMultiplier) b.peakMultiplier = r.peakMultiplier;
     }
-    if (r.mode === "math" && (r.mathRounds || 0) > b.mostRounds) b.mostRounds = r.mathRounds;
+    if (r.mode === "memory" && (r.memoryRounds || 0) > b.mostRounds) b.mostRounds = r.memoryRounds;
   }
   return result;
 }
@@ -270,8 +270,8 @@ function timeAgo(ts) {
   return `${d}d`;
 }
 
-const MODE_LABEL = { classic: "CLASSIC", rgb: "RBG", math: "MATH" };
-const MODES = ["classic", "rgb", "math"];
+const MODE_LABEL = { classic: "CLASSIC", rgb: "RBG", memory: "MEMORY" };
+const MODES = ["classic", "rgb", "memory"];
 
 const themes = {
   night: { bg: "#0a0a0a", fg: "#ffffff", fgMid: "rgba(255,255,255,0.5)", fgLow: "rgba(255,255,255,0.3)", fgFaint: "rgba(255,255,255,0.12)", fgSubtle: "rgba(255,255,255,0.08)", bar: "rgba(255,255,255,0.35)" },
@@ -315,7 +315,7 @@ const markShapes = [
   (s) => <rect width={s} height={s} fill="currentColor" />,
 ];
 
-function Mark({ mark, onTap, theme, rgbColor, label }) {
+function Mark({ mark, onTap, theme, rgbColor, label, flipped }) {
   const [progress, setProgress] = useState(0);
   const frameRef = useRef();
   const startRef = useRef(Date.now());
@@ -343,17 +343,33 @@ function Mark({ mark, onTap, theme, rgbColor, label }) {
         display: "flex", alignItems: "center", justifyContent: "center",
         cursor: "pointer", WebkitTapHighlightColor: "transparent", touchAction: "manipulation",
       }}>
-      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}
-        style={{ color: fillColor, opacity, transition:"opacity 0.05s" }}>
-        {shape(size)}
-      </svg>
-      {label != null && (
-        <span style={{
-          position:"absolute", fontSize:20, fontWeight:400,
-          fontFamily:"'Press Start 2P', monospace",
-          color: theme.bg, pointerEvents:"none", opacity,
-        }}>{label}</span>
-      )}
+      {/* Flip wrapper: scaleX animates 1→0→1 when `flipped` becomes true.
+          The key change retriggers the @keyframes animation; without it React reuses the same DOM node. */}
+      <div key={flipped ? "back" : "front"}
+        style={{
+          width: size, height: size, position: "relative",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          animation: flipped ? "tileFlip 320ms ease-out" : undefined,
+        }}>
+        <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}
+          style={{ color: fillColor, opacity, transition:"opacity 0.05s" }}>
+          {shape(size)}
+        </svg>
+        {label != null && !flipped && (
+          <span style={{
+            position:"absolute", fontSize:20, fontWeight:400,
+            fontFamily:"'Press Start 2P', monospace",
+            color: theme.bg, pointerEvents:"none", opacity,
+          }}>{label}</span>
+        )}
+        {flipped && (
+          <span style={{
+            position:"absolute", width: 8, height: 8,
+            backgroundColor: theme.bg, opacity: 0.35 * opacity,
+            pointerEvents:"none",
+          }} />
+        )}
+      </div>
     </div>
   );
 }
@@ -477,9 +493,10 @@ export default function TapAppPop() {
   const [pressure, setPressure] = useState(0);
   const [peakPressure, setPeakPressure] = useState(0);
   const [missed, setMissed] = useState(0);
-  // MATH state
-  const [mathNext, setMathNext] = useState(1);
-  const [mathRounds, setMathRounds] = useState(0);
+  // MEMORY state
+  const [memoryNext, setMemoryNext] = useState(1);
+  const [memoryRounds, setMemoryRounds] = useState(0);
+  const [memoryPhase, setMemoryPhase] = useState("idle"); // "idle" | "preview" | "tap"
   // Combo & FX state
   const [combo, setCombo] = useState(0);
   const [comboBump, setComboBump] = useState(0);
@@ -502,9 +519,8 @@ export default function TapAppPop() {
   const markColors = useRef({});
   const markLabels = useRef({});
   const markPositions = useRef({});
-  const mathRoundRef = useRef(0);
-  const mathCounterRef = useRef(1); // running number counter, resets on life loss
-  const mathTimers = useRef([]);
+  const memoryRoundRef = useRef(0);
+  const memoryTimers = useRef([]);
   const classicStartRef = useRef(0);
   const spawnTimer = useRef();
   const gameTimer = useRef();
@@ -513,10 +529,11 @@ export default function TapAppPop() {
   const comboRef = useRef(0);
   const rgbNextRef = useRef(0);
   const missedRef = useRef(0);
-  const mathNextRef = useRef(1);
+  const memoryNextRef = useRef(1);
+  const memoryPhaseRef = useRef("idle"); // gates taps during preview/flip
   const t = themes[mode];
 
-  const cleanup = () => { clearTimeout(spawnTimer.current); clearInterval(gameTimer.current); mathTimers.current.forEach(clearTimeout); mathTimers.current = []; };
+  const cleanup = () => { clearTimeout(spawnTimer.current); clearInterval(gameTimer.current); memoryTimers.current.forEach(clearTimeout); memoryTimers.current = []; };
 
   // --- Combo + particle + shake helpers ---
   const resetCombo = () => {
@@ -690,57 +707,76 @@ export default function TapAppPop() {
     scheduleRgb();
   }, [scheduleRgb]);
 
-  // --- MATH spawning ---
-  const spawnMathBatch = useCallback(() => {
-    const diff = mathDifficulty(mathRoundRef.current);
-    const batchSize = diff.batchSize;
-    const startNum = mathCounterRef.current;
-    setMathNext(startNum);
-    mathNextRef.current = startNum;
+  // --- MEMORY spawning ---
+  // Round flow:
+  //   1. Spawn N tiles face-up (numbers visible) at non-overlapping positions.
+  //   2. After previewMs, flip every tile face-down (memoryPhase = "tap"); start the lifetime timer.
+  //   3. Player taps in ascending order. Lifetime expiry costs a life and starts a new round.
+  // Taps are gated by memoryPhaseRef so the preview window doesn't accept input.
+  const spawnMemoryRound = useCallback(() => {
+    const diff = memoryDifficulty(memoryRoundRef.current);
+    const tileCount = diff.tileCount;
+    setMemoryNext(1);
+    memoryNextRef.current = 1;
+    memoryPhaseRef.current = "preview";
+    setMemoryPhase("preview");
     // Compute positions OUTSIDE setMarks for StrictMode safety (see Classic spawn).
     const placed = [];
-    const batchMarks = [];
-    for (let i = 0; i < batchSize; i++) {
-      const num = startNum + i;
+    const roundMarks = [];
+    for (let i = 0; i < tileCount; i++) {
+      const num = i + 1;
       const id = Date.now() + Math.random() + i;
       const pos = randomPos(placed);
       placed.push(pos);
       markBirths.current[id] = Date.now();
       markLabels.current[id] = num;
       markPositions.current[id] = pos;
-      batchMarks.push({ id, ...pos, lifetime: diff.lifetime, shape: 0 });
+      // `flipped: false` during preview, flips to true after previewMs.
+      roundMarks.push({ id, ...pos, lifetime: diff.lifetime, shape: 0, flipped: false });
     }
-    setMarks(() => batchMarks);
-    // single batch expiry — clear all remaining, lose a life, reset counter
-    const timer = setTimeout(() => {
-      setMarks((prev) => {
-        if (prev.length === 0) return prev;
-        prev.forEach((m) => { delete markBirths.current[m.id]; delete markLabels.current[m.id]; delete markPositions.current[m.id]; });
-        return [];
-      });
-      mathCounterRef.current = 1;
-      audio.sfxLifeLost();
-      setLives((l) => {
-        const next = l - 1;
-        livesRef.current = next;
-        if (next <= 0) { cleanup(); audio.sfxGameOver(); setTimeout(() => setScreen("end"), 400); }
-        else { setTimeout(() => spawnMathBatch(), 400); }
-        return next;
-      });
-    }, diff.lifetime);
-    mathTimers.current.push(timer);
+    setMarks(() => roundMarks);
+
+    // After preview, flip all tiles face-down and start the round-lifetime timer.
+    const flipTimer = setTimeout(() => {
+      setMarks((prev) => prev.map((m) => ({ ...m, flipped: true })));
+      memoryPhaseRef.current = "tap";
+      setMemoryPhase("tap");
+      // Round-expiry timer: if the player runs out of time, lose a life.
+      const expiryTimer = setTimeout(() => {
+        memoryPhaseRef.current = "idle";
+        setMemoryPhase("idle");
+        setMarks([]);
+        markBirths.current = {};
+        markLabels.current = {};
+        markPositions.current = {};
+        audio.sfxLifeLost();
+        livesRef.current -= 1;
+        const livesAfter = livesRef.current;
+        setLives(livesAfter);
+        if (livesAfter <= 0) {
+          cleanup();
+          audio.sfxGameOver();
+          setTimeout(() => setScreen("end"), 400);
+        } else {
+          setTimeout(() => spawnMemoryRound(), 400);
+        }
+      }, diff.lifetime);
+      memoryTimers.current.push(expiryTimer);
+    }, diff.previewMs);
+    memoryTimers.current.push(flipTimer);
   }, []);
 
-  const startMath = useCallback(() => {
+  const startMemory = useCallback(() => {
     setScore(0); setMarks([]); setFloats([]); setParticles([]); setTapPops([]); setFlashes([]); setTaps(0); setMisses(0);
     setCombo(0); comboRef.current = 0;
-    setLives(MATH_MAX_LIVES); livesRef.current = MATH_MAX_LIVES;
-    setMathNext(1); mathNextRef.current = 1; setMathRounds(0); mathRoundRef.current = 0; mathCounterRef.current = 1;
+    setLives(MEMORY_MAX_LIVES); livesRef.current = MEMORY_MAX_LIVES;
+    setMemoryNext(1); memoryNextRef.current = 1; setMemoryRounds(0); memoryRoundRef.current = 0;
+    memoryPhaseRef.current = "idle"; setMemoryPhase("idle");
     markBirths.current = {}; markLabels.current = {}; markPositions.current = {}; spawnIndex = 0;
-    mathTimers.current.forEach(clearTimeout); mathTimers.current = [];
-    setGameMode("math"); setScreen("play");
-    setTimeout(() => spawnMathBatch(), 100);
-  }, [spawnMathBatch]);
+    memoryTimers.current.forEach(clearTimeout); memoryTimers.current = [];
+    setGameMode("memory"); setScreen("play");
+    setTimeout(() => spawnMemoryRound(), 100);
+  }, [spawnMemoryRound]);
 
   useEffect(() => cleanup, []);
 
@@ -754,7 +790,7 @@ export default function TapAppPop() {
   // --- Record run to history when a game ends ---
   useEffect(() => {
     if (screen !== "end") return;
-    const run = buildRun(gameMode, { score, taps, misses, rgbChains, peakPressure, mathRounds });
+    const run = buildRun(gameMode, { score, taps, misses, rgbChains, peakPressure, memoryRounds });
     setHistory(appendRun(run));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [screen]);
@@ -850,21 +886,20 @@ export default function TapAppPop() {
     }
   }, []);
 
-  // --- MATH tap ---
-  // Refactored from a setMathNext-updater pattern to ref-based reads so all
-  // side effects (audio, particles, playTapFeedback) fire exactly once per tap
-  // even under React StrictMode (which double-invokes state updaters).
-  const handleMathTap = useCallback((id) => {
+  // --- MEMORY tap ---
+  // Taps during the preview phase are ignored via memoryPhaseRef.
+  const handleMemoryTap = useCallback((id) => {
+    if (memoryPhaseRef.current !== "tap") return;
     const birth = markBirths.current[id];
     if (birth == null) return;
     const num = markLabels.current[id];
     const pos = markPositions.current[id];
-    const expected = mathNextRef.current;
+    const expected = memoryNextRef.current;
 
     if (num === expected) {
-      // Correct tap
+      // Correct tap — playTapFeedback's ghost reveals the number to the player.
       audio.sfxTap();
-      const diff = mathDifficulty(mathRoundRef.current);
+      const diff = memoryDifficulty(memoryRoundRef.current);
       const pts = scoreFromReaction(Date.now() - birth, diff.lifetime);
       delete markBirths.current[id];
       delete markLabels.current[id];
@@ -879,30 +914,27 @@ export default function TapAppPop() {
       setScore((s) => s + pts);
       setTaps((tt) => tt + 1);
 
-      const next = expected + 1;
-      const batchEnd = mathCounterRef.current + diff.batchSize;
-      if (next >= batchEnd) {
-        // Round complete — schedule the next batch
+      if (num >= diff.tileCount) {
+        // Round complete — schedule the next round
         audio.sfxBatchComplete();
-        mathCounterRef.current = batchEnd;
-        mathRoundRef.current += 1;
-        setMathRounds((r) => r + 1);
-        mathTimers.current.forEach(clearTimeout);
-        mathTimers.current = [];
-        setTimeout(() => spawnMathBatch(), 400);
-        mathNextRef.current = batchEnd;
-        setMathNext(batchEnd);
+        memoryRoundRef.current += 1;
+        setMemoryRounds((r) => r + 1);
+        memoryPhaseRef.current = "idle";
+        setMemoryPhase("idle");
+        memoryTimers.current.forEach(clearTimeout);
+        memoryTimers.current = [];
+        setTimeout(() => spawnMemoryRound(), 400);
+        memoryNextRef.current = num + 1;
+        setMemoryNext(num + 1);
       } else {
-        mathNextRef.current = next;
-        setMathNext(next);
+        memoryNextRef.current = num + 1;
+        setMemoryNext(num + 1);
       }
 
-      // Visual flair for the successful tap (outside of any state updater).
       if (pos) playTapFeedback(pos.x, pos.y, t.fg, num);
     } else {
-      // Wrong tap — clear batch, lose a life, reset counter
+      // Wrong tap — clear round, lose a life
       audio.sfxMiss();
-      mathCounterRef.current = 1;
       if (pos) {
         const floatId = Date.now() + Math.random();
         setFloats((f) => [...f, { id: floatId, x: pos.x, y: pos.y, value: 0, text: "X", color: "#ef4444" }]);
@@ -912,11 +944,14 @@ export default function TapAppPop() {
       markBirths.current = {};
       markLabels.current = {};
       markPositions.current = {};
-      mathTimers.current.forEach(clearTimeout);
-      mathTimers.current = [];
+      memoryTimers.current.forEach(clearTimeout);
+      memoryTimers.current = [];
+      memoryPhaseRef.current = "idle";
+      setMemoryPhase("idle");
 
       livesRef.current -= 1;
       audio.sfxLifeLost();
+      triggerShake();
       const livesAfter = livesRef.current;
       setLives(livesAfter);
       if (livesAfter <= 0) {
@@ -924,14 +959,14 @@ export default function TapAppPop() {
         audio.sfxGameOver();
         setTimeout(() => setScreen("end"), 400);
       } else {
-        setTimeout(() => spawnMathBatch(), 400);
+        setTimeout(() => spawnMemoryRound(), 400);
       }
-      mathNextRef.current = 1;
-      setMathNext(1);
+      memoryNextRef.current = 1;
+      setMemoryNext(1);
     }
-  }, [spawnMathBatch, t.fg]);
+  }, [spawnMemoryRound, t.fg]);
 
-  const handleTap = gameMode === "math" ? handleMathTap : gameMode === "rgb" ? handleRgbTap : handleClassicTap;
+  const handleTap = gameMode === "memory" ? handleMemoryTap : gameMode === "rgb" ? handleRgbTap : handleClassicTap;
 
   const toggleMode = (e) => { e.preventDefault(); e.stopPropagation(); setMode((m) => m === "night" ? "day" : "night"); };
 
@@ -957,6 +992,8 @@ export default function TapAppPop() {
     @keyframes tapGlow { 0% { transform:translate(-50%,-50%) scale(1); opacity:0.6; } 100% { transform:translate(-50%,-50%) scale(1.6); opacity:0; } }
     /* Tap feedback: extremely subtle full-screen colored flash. */
     @keyframes flashFade { 0% { opacity:0.06; } 100% { opacity:0; } }
+    /* MEMORY mode: tile flip from face-up to face-down (scaleX hits 0 at midpoint). */
+    @keyframes tileFlip { 0% { transform:scaleX(1); } 50% { transform:scaleX(0.05); } 100% { transform:scaleX(1); } }
   `;
 
   const [muted, setMuted] = useState(false);
@@ -987,7 +1024,7 @@ export default function TapAppPop() {
         <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", height:"100%", gap:12, position:"relative", zIndex:1 }}>
           <Btn label="CLASSIC" onClick={startClassic} theme={t} />
           <Btn label="RBG" onClick={startRgb} theme={t} ghost />
-          <Btn label="MATH" onClick={startMath} theme={t} ghost />
+          <Btn label="MEMORY" onClick={startMemory} theme={t} ghost />
           <div style={{ display:"flex", justifyContent:"space-between", width:180, marginTop:32 }}>
             <div onPointerDown={(e) => { e.preventDefault(); e.stopPropagation(); setScreen("title"); }}
               style={{ fontSize:7, color:t.fgLow, letterSpacing:2, cursor:"pointer", WebkitTapHighlightColor:"transparent", touchAction:"manipulation" }}>BACK</div>
@@ -1058,7 +1095,7 @@ export default function TapAppPop() {
     const secondaryStat = (r) => {
       if (r.mode === "classic") return `ACC ${r.accuracy ?? 0}%`;
       if (r.mode === "rgb") return `x${(r.peakMultiplier ?? 1).toFixed(2)} · ${r.rgbChains ?? 0}C`;
-      if (r.mode === "math") return `R ${r.mathRounds ?? 0}`;
+      if (r.mode === "memory") return `R ${r.memoryRounds ?? 0}`;
       return "";
     };
 
@@ -1202,21 +1239,21 @@ export default function TapAppPop() {
   if (screen === "end") {
     const avg = taps > 0 ? Math.round(score / taps) : 0;
     const isRgb = gameMode === "rgb";
-    const isMath = gameMode === "math";
-    const accuracy = !isRgb && !isMath && taps + misses > 0 ? Math.round((taps / (taps + misses)) * 100) : 0;
-    const startFn = isMath ? startMath : isRgb ? startRgb : startClassic;
+    const isMemory = gameMode === "memory";
+    const accuracy = !isRgb && !isMemory && taps + misses > 0 ? Math.round((taps / (taps + misses)) * 100) : 0;
+    const startFn = isMemory ? startMemory : isRgb ? startRgb : startClassic;
     return (
       <div style={base}>
         <style>{globalStyles}</style>
         <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", height:"100%", gap:0 }}>
           <p style={{ fontSize:10, color:t.fgMid, letterSpacing:4, marginBottom:8 }}>
-            {isMath ? "MATH" : isRgb ? "RBG" : "CLASSIC"}
+            {isMemory ? "MEMORY" : isRgb ? "RBG" : "CLASSIC"}
           </p>
           <h1 style={{ fontSize:48, fontWeight:400, letterSpacing:4 }}>{score}</h1>
           <div style={{ display:"flex", gap:32, marginTop:32 }}>
-            {isMath ? (
+            {isMemory ? (
               <>
-                {[[taps,"TAPS"],[mathRounds,"ROUNDS"],[avg,"AVG"]].map(([val,lbl])=>(
+                {[[taps,"TAPS"],[memoryRounds,"ROUNDS"],[avg,"AVG"]].map(([val,lbl])=>(
                   <div key={lbl} style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:8 }}>
                     <span style={{ fontSize:16 }}>{val}</span>
                     <span style={{ fontSize:7, color:t.fgLow, letterSpacing:2 }}>{lbl}</span>
@@ -1260,7 +1297,7 @@ export default function TapAppPop() {
 
   // ===== PLAY =====
   const isRgb = gameMode === "rgb";
-  const isMathPlay = gameMode === "math";
+  const isMemoryPlay = gameMode === "memory";
 
   return (
     <div style={base}>
@@ -1275,10 +1312,12 @@ export default function TapAppPop() {
             </span>
           )}
         </div>
-        {isMathPlay ? (
+        {isMemoryPlay ? (
           <div style={{ display:"flex", alignItems:"center", gap:16 }}>
-            <span style={{ fontSize:9, color:t.fgMid, letterSpacing:1 }}>NEXT: {mathNext}</span>
-            <Lives lives={lives} max={MATH_MAX_LIVES} />
+            <span style={{ fontSize:9, color:t.fgMid, letterSpacing:1 }}>
+              {memoryPhase === "preview" ? "MEMORIZE" : `NEXT: ${memoryNext}`}
+            </span>
+            <Lives lives={lives} max={MEMORY_MAX_LIVES} />
           </div>
         ) : isRgb ? (
           <div style={{ display:"flex", alignItems:"center", gap:16 }}>
@@ -1295,10 +1334,10 @@ export default function TapAppPop() {
         )}
       </div>
 
-      {/* Time bar (classic) / Pressure bar (RGB) / Round indicator (MATH) */}
-      {isMathPlay ? (
+      {/* Time bar (classic) / Pressure bar (RGB) / Round indicator (MEMORY) */}
+      {isMemoryPlay ? (
         <div style={{ position:"absolute", top:88, left:20, right:20, height:2, backgroundColor:t.fgSubtle, zIndex:10 }}>
-          <div style={{ height:"100%", width:`${(mathNext - 1) / mathDifficulty(mathRoundRef.current).batchSize * 100}%`,
+          <div style={{ height:"100%", width:`${(memoryNext - 1) / memoryDifficulty(memoryRoundRef.current).tileCount * 100}%`,
             backgroundColor:"#4ade80", transition:"width 0.3s ease-out" }} />
         </div>
       ) : !isRgb ? (
@@ -1320,7 +1359,8 @@ export default function TapAppPop() {
         {marks.map((m) => (
           <Mark key={m.id} mark={m} onTap={handleTap} theme={t}
             rgbColor={isRgb ? RGB_COLORS[markColors.current[m.id]]?.color : null}
-            label={isMathPlay ? markLabels.current[m.id] : null} />
+            label={isMemoryPlay ? markLabels.current[m.id] : null}
+            flipped={isMemoryPlay ? m.flipped : false} />
         ))}
         {floats.map((f) => (
           <FloatingText key={f.id} x={f.x} y={f.y} value={f.value} text={f.text} color={f.color} />
